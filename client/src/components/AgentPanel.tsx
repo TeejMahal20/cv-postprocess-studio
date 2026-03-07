@@ -2,11 +2,14 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   Sparkles,
   MessageSquare,
+  HelpCircle,
   Trash2,
   BookOpen,
   ChevronDown,
   ChevronRight,
   History,
+  Image,
+  Layers,
 } from 'lucide-react';
 import type {
   UploadResponse,
@@ -36,6 +39,7 @@ interface AgentPanelProps {
   chatHistory: ChatMessage[];
   onGenerate: (prompt: string) => Promise<void>;
   onGenerateAndRun: (prompt: string) => Promise<void>;
+  onChat: (prompt: string) => Promise<void>;
   onRun: () => void;
   onClearHistory: () => void;
   // Recipe props
@@ -46,6 +50,9 @@ interface AgentPanelProps {
   onDeleteRecipe: (id: string) => void;
   onDownloadRecipe: (id: string) => void;
   onPromoteRecipe: (id: string, name: string) => void;
+  // Snapshot mode
+  snapshotMode: 'annotations' | 'full';
+  setSnapshotMode: (mode: 'annotations' | 'full') => void;
 }
 
 function ChatBubble({ message }: { message: ChatMessage }) {
@@ -94,8 +101,9 @@ function ChatBubble({ message }: { message: ChatMessage }) {
 }
 
 const EXAMPLE_PROMPTS = [
+  'What measurements would make sense for these features?',
+  'Suggest next steps based on the current results',
   'Measure area and roundness of all features',
-  'Compute width and height of each bounding box in mm',
   'Count defects per category and summarize',
 ];
 
@@ -109,6 +117,7 @@ export default function AgentPanel({
   chatHistory,
   onGenerate,
   onGenerateAndRun,
+  onChat,
   onRun,
   onClearHistory,
   recipes,
@@ -118,6 +127,8 @@ export default function AgentPanel({
   onDeleteRecipe,
   onDownloadRecipe,
   onPromoteRecipe,
+  snapshotMode,
+  setSnapshotMode,
 }: AgentPanelProps) {
   const [prompt, setPrompt] = useState('');
   const [showRecipes, setShowRecipes] = useState(false);
@@ -151,6 +162,12 @@ export default function AgentPanel({
   const handleGenerateAndRun = async () => {
     if (!prompt.trim()) return;
     await onGenerateAndRun(prompt.trim());
+    setPrompt('');
+  };
+
+  const handleChat = async () => {
+    if (!prompt.trim()) return;
+    await onChat(prompt.trim());
     setPrompt('');
   };
 
@@ -257,7 +274,7 @@ export default function AgentPanel({
         <textarea
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          placeholder="Describe the measurements you want to extract..."
+          placeholder="Ask a question or describe measurements to generate..."
           className="w-full h-20 px-3 py-2 bg-gray-800 border border-gray-600 rounded text-sm resize-none focus:border-blue-500 focus:outline-none placeholder-gray-500"
         />
 
@@ -274,8 +291,45 @@ export default function AgentPanel({
           ))}
         </div>
 
+        {/* Vision snapshot mode */}
+        <div className="flex items-center gap-1 text-[10px] text-gray-500">
+          <span>Send to agent:</span>
+          <button
+            onClick={() => setSnapshotMode('annotations')}
+            title="Send only annotations overlay (no base image)"
+            className={`flex items-center gap-1 px-1.5 py-0.5 rounded ${
+              snapshotMode === 'annotations'
+                ? 'bg-orange-600/20 text-orange-400 ring-1 ring-orange-500/40'
+                : 'text-gray-500 hover:text-gray-300 hover:bg-gray-800'
+            }`}
+          >
+            <Layers className="w-3 h-3" />
+            Annotations
+          </button>
+          <button
+            onClick={() => setSnapshotMode('full')}
+            title="Send full canvas (image + annotations)"
+            className={`flex items-center gap-1 px-1.5 py-0.5 rounded ${
+              snapshotMode === 'full'
+                ? 'bg-orange-600/20 text-orange-400 ring-1 ring-orange-500/40'
+                : 'text-gray-500 hover:text-gray-300 hover:bg-gray-800'
+            }`}
+          >
+            <Image className="w-3 h-3" />
+            Image + Annotations
+          </button>
+        </div>
+
         {/* Action buttons */}
         <div className="flex gap-2">
+          <button
+            onClick={handleChat}
+            disabled={!prompt.trim() || isGenerating}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 text-sm font-medium transition-colors"
+          >
+            <HelpCircle className="w-4 h-4" />
+            {isGenerating ? 'Thinking...' : 'Ask'}
+          </button>
           <button
             onClick={handleGenerate}
             disabled={!prompt.trim() || isGenerating}

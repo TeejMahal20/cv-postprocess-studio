@@ -1,9 +1,19 @@
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useState, useCallback, forwardRef, useImperativeHandle } from 'react';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
-import { Eye, EyeOff, ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
-import type { COCODataset, ExecuteResponse } from '../../../shared/types';
+import {
+  Eye, EyeOff, ZoomIn, ZoomOut, Maximize2,
+  MousePointer2, CircleDot, ArrowUpRight, Square, Type,
+  Undo2, Trash2,
+} from 'lucide-react';
+import type { COCODataset, ExecuteResponse, HumanAnnotation, DrawingTool, ImageEntry } from '../../../shared/types';
 import { getFileUrl } from '../api';
 import { useCanvasOverlay, getCategoryColor } from '../hooks/useCanvasOverlay';
+import { useHumanAnnotations } from '../hooks/useHumanAnnotations';
+import ImageNavigator from './ImageNavigator';
+
+export interface CanvasViewerHandle {
+  captureSnapshot(includeBaseImage: boolean): string | null;
+}
 
 interface CanvasViewerProps {
   sessionId: string;
@@ -13,6 +23,16 @@ interface CanvasViewerProps {
   cocoData: COCODataset | null;
   executionResult: ExecuteResponse | null;
   highlightedFeature: number | null;
+  humanAnnotations: HumanAnnotation[];
+  onAddAnnotation: (anno: HumanAnnotation) => void;
+  onUndoAnnotation: () => void;
+  onClearAnnotations: () => void;
+  activeTool: DrawingTool;
+  onSetActiveTool: (tool: DrawingTool) => void;
+  imageList: ImageEntry[];
+  currentImageIndex: number;
+  onSwitchImage: (index: number) => void;
+  isSwitchingImage: boolean;
 }
 
 interface LayerVisibility {
@@ -21,7 +41,15 @@ interface LayerVisibility {
   results: boolean;
 }
 
-export default function CanvasViewer({
+const TOOLS: { tool: DrawingTool; icon: typeof MousePointer2; label: string }[] = [
+  { tool: 'pan', icon: MousePointer2, label: 'Pan' },
+  { tool: 'point', icon: CircleDot, label: 'Point' },
+  { tool: 'line', icon: ArrowUpRight, label: 'Line' },
+  { tool: 'rect', icon: Square, label: 'Rect' },
+  { tool: 'text', icon: Type, label: 'Text' },
+];
+
+const CanvasViewer = forwardRef<CanvasViewerHandle, CanvasViewerProps>(function CanvasViewer({
   sessionId,
   imageFilename,
   imageWidth,
@@ -29,11 +57,22 @@ export default function CanvasViewer({
   cocoData,
   executionResult,
   highlightedFeature: _highlightedFeature,
-}: CanvasViewerProps) {
+  humanAnnotations,
+  onAddAnnotation,
+  onUndoAnnotation,
+  onClearAnnotations,
+  activeTool,
+  onSetActiveTool,
+  imageList,
+  currentImageIndex,
+  onSwitchImage,
+  isSwitchingImage,
+}, ref) {
   const mainCanvasRef = useRef<HTMLCanvasElement>(null);
   const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const annoCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const resultsCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const humanAnnoCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [layers, setLayers] = useState<LayerVisibility>({
     base: true,
@@ -44,15 +83,76 @@ export default function CanvasViewer({
     new Set(),
   );
   const [imageLoaded, setImageLoaded] = useState(false);
+  const [textValue, setTextValue] = useState('');
+  const textInputRef = useRef<HTMLInputElement>(null);
 
   const { drawAnnotations, drawOverlays } = useCanvasOverlay();
+  const humanAnno = useHumanAnnotations(activeTool, humanAnnotations, onAddAnnotation);
+
+  // Expose captureSnapshot to parent via ref
+  // Max dimension for Claude vision (keeps payload small + within API limits)
+  const SNAPSHOT_MAX_DIM = 1568;
+
+  useImperativeHandle(ref, () => ({
+    captureSnapshot(includeBaseImage: boolean): string | null {
+      if (!imageWidth || !imageHeight) return null;
+
+      // Composite at full resolution first
+      const full = document.createElement('canvas');
+      full.width = imageWidth;
+      full.height = imageHeight;
+      const fctx = full.getContext('2d');
+      if (!fctx) return null;
+
+      if (includeBaseImage && baseCanvasRef.current) {
+        fctx.drawImage(baseCanvasRef.current, 0, 0);
+      } else {
+        fctx.fillStyle = '#000000';
+        fctx.fillRect(0, 0, imageWidth, imageHeight);
+      }
+
+      if (annoCanvasRef.current) {
+        fctx.globalAlpha = 0.6;
+        fctx.drawImage(annoCanvasRef.current, 0, 0);
+        fctx.globalAlpha = 1.0;
+      }
+      if (resultsCanvasRef.current) {
+        fctx.drawImage(resultsCanvasRef.current, 0, 0);
+      }
+      if (humanAnnoCanvasRef.current) {
+        fctx.drawImage(humanAnnoCanvasRef.current, 0, 0);
+      }
+
+      // Downscale if needed to keep payload manageable
+      const longest = Math.max(imageWidth, imageHeight);
+      let outCanvas = full;
+      if (longest > SNAPSHOT_MAX_DIM) {
+        const scale = SNAPSHOT_MAX_DIM / longest;
+        const outW = Math.round(imageWidth * scale);
+        const outH = Math.round(imageHeight * scale);
+        const scaled = document.createElement('canvas');
+        scaled.width = outW;
+        scaled.height = outH;
+        const sctx = scaled.getContext('2d');
+        if (sctx) {
+          sctx.drawImage(full, 0, 0, outW, outH);
+          outCanvas = scaled;
+        }
+      }
+
+      // Encode as JPEG for much smaller payload (PNG base64 can be 20MB+)
+      const dataUrl = outCanvas.toDataURL('image/jpeg', 0.8);
+      return dataUrl.replace(/^data:image\/jpeg;base64,/, '');
+    },
+  }), [imageWidth, imageHeight]);
 
   // Initialize offscreen canvases
   useEffect(() => {
     baseCanvasRef.current = document.createElement('canvas');
     annoCanvasRef.current = document.createElement('canvas');
     resultsCanvasRef.current = document.createElement('canvas');
-    [baseCanvasRef, annoCanvasRef, resultsCanvasRef].forEach((ref) => {
+    humanAnnoCanvasRef.current = document.createElement('canvas');
+    [baseCanvasRef, annoCanvasRef, resultsCanvasRef, humanAnnoCanvasRef].forEach((ref) => {
       if (ref.current) {
         ref.current.width = imageWidth;
         ref.current.height = imageHeight;
@@ -73,6 +173,10 @@ export default function CanvasViewer({
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+
+    // Reset so composite waits for the new image before rendering
+    setImageLoaded(false);
+    ctx.clearRect(0, 0, imageWidth, imageHeight);
 
     const img = new Image();
     img.crossOrigin = 'anonymous';
@@ -100,16 +204,25 @@ export default function CanvasViewer({
     if (!ctx) return;
     ctx.clearRect(0, 0, imageWidth, imageHeight);
 
-    if (executionResult?.success && executionResult.result?.overlays) {
+    if (executionResult?.success && executionResult.result?.overlays && executionResult.run_id) {
       drawOverlays(
         ctx,
         executionResult.result.overlays,
         sessionId,
         executionResult.run_id,
-        () => composite(), // re-composite when async mask loads
+        () => composite(),
       );
     }
   }, [executionResult, sessionId, imageWidth, imageHeight, drawOverlays]);
+
+  // Draw human annotations layer
+  useEffect(() => {
+    if (!humanAnnoCanvasRef.current) return;
+    const ctx = humanAnnoCanvasRef.current.getContext('2d');
+    if (!ctx) return;
+    humanAnno.drawLayer(ctx);
+    composite();
+  }, [humanAnno.drawLayer]);
 
   // Composite all layers
   const composite = useCallback(() => {
@@ -131,6 +244,9 @@ export default function CanvasViewer({
     if (layers.results && resultsCanvasRef.current) {
       ctx.drawImage(resultsCanvasRef.current, 0, 0);
     }
+    if (humanAnnoCanvasRef.current) {
+      ctx.drawImage(humanAnnoCanvasRef.current, 0, 0);
+    }
   }, [layers, imageWidth, imageHeight]);
 
   // Re-composite when layers toggle or content changes
@@ -147,10 +263,72 @@ export default function CanvasViewer({
     });
   };
 
+  // Mouse handlers for drawing on canvas
+  const handleCanvasMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (activeTool === 'pan') return;
+      const imageX = e.nativeEvent.offsetX;
+      const imageY = e.nativeEvent.offsetY;
+      humanAnno.handleMouseDown(imageX, imageY, e.clientX, e.clientY);
+    },
+    [activeTool, humanAnno.handleMouseDown],
+  );
+
+  const handleCanvasMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (activeTool === 'pan') return;
+      humanAnno.handleMouseMove(e.nativeEvent.offsetX, e.nativeEvent.offsetY);
+    },
+    [activeTool, humanAnno.handleMouseMove],
+  );
+
+  const handleCanvasMouseUp = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (activeTool === 'pan') return;
+      humanAnno.handleMouseUp(e.nativeEvent.offsetX, e.nativeEvent.offsetY);
+    },
+    [activeTool, humanAnno.handleMouseUp],
+  );
+
+  // Text input confirmation
+  const handleTextConfirm = useCallback(() => {
+    if (!humanAnno.textInput || !textValue.trim()) {
+      humanAnno.setTextInput(null);
+      setTextValue('');
+      return;
+    }
+    onAddAnnotation({
+      type: 'text',
+      id: crypto.randomUUID(),
+      x: humanAnno.textInput.x,
+      y: humanAnno.textInput.y,
+      text: textValue.trim(),
+    });
+    humanAnno.setTextInput(null);
+    setTextValue('');
+  }, [humanAnno.textInput, textValue, onAddAnnotation, humanAnno.setTextInput]);
+
+  // Focus text input when it appears
+  useEffect(() => {
+    if (humanAnno.textInput) {
+      setTextValue('');
+      setTimeout(() => textInputRef.current?.focus(), 0);
+    }
+  }, [humanAnno.textInput]);
+
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Toolbar */}
-      <div className="flex items-center gap-3 px-3 py-2 border-b border-gray-700 bg-gray-800 text-xs shrink-0 flex-wrap">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-700 bg-gray-800 text-xs shrink-0 flex-wrap">
+        {/* Image navigation */}
+        <ImageNavigator
+          imageList={imageList}
+          currentIndex={currentImageIndex}
+          onSwitch={onSwitchImage}
+          isSwitching={isSwitchingImage}
+        />
+        {imageList.length > 1 && <div className="w-px h-4 bg-gray-600" />}
+
         {/* Layer toggles */}
         {(['base', 'annotations', 'results'] as const).map((layer) => (
           <button
@@ -170,6 +348,51 @@ export default function CanvasViewer({
             {layer}
           </button>
         ))}
+
+        <div className="w-px h-4 bg-gray-600" />
+
+        {/* Drawing tools */}
+        {TOOLS.map(({ tool, icon: Icon, label }) => (
+          <button
+            key={tool}
+            onClick={() => onSetActiveTool(tool)}
+            title={label}
+            className={`flex items-center gap-1 px-2 py-1 rounded ${
+              activeTool === tool
+                ? 'bg-orange-600/30 text-orange-400 ring-1 ring-orange-500/50'
+                : 'text-gray-500 hover:text-gray-300 hover:bg-gray-700'
+            }`}
+          >
+            <Icon className="w-3 h-3" />
+            {label}
+          </button>
+        ))}
+
+        <div className="w-px h-4 bg-gray-600" />
+
+        {/* Undo / Clear */}
+        <button
+          onClick={onUndoAnnotation}
+          disabled={humanAnnotations.length === 0}
+          title="Undo last annotation"
+          className="flex items-center gap-1 px-2 py-1 rounded text-gray-500 hover:text-gray-300 hover:bg-gray-700 disabled:opacity-30 disabled:cursor-not-allowed"
+        >
+          <Undo2 className="w-3 h-3" />
+        </button>
+        <button
+          onClick={onClearAnnotations}
+          disabled={humanAnnotations.length === 0}
+          title="Clear all annotations"
+          className="flex items-center gap-1 px-2 py-1 rounded text-gray-500 hover:text-red-400 hover:bg-gray-700 disabled:opacity-30 disabled:cursor-not-allowed"
+        >
+          <Trash2 className="w-3 h-3" />
+        </button>
+
+        {humanAnnotations.length > 0 && (
+          <span className="text-gray-500 ml-1">
+            {humanAnnotations.length} annotation{humanAnnotations.length !== 1 ? 's' : ''}
+          </span>
+        )}
 
         <div className="w-px h-4 bg-gray-600" />
 
@@ -194,12 +417,13 @@ export default function CanvasViewer({
       </div>
 
       {/* Canvas with zoom/pan */}
-      <div className="flex-1 overflow-hidden bg-gray-950">
+      <div className="flex-1 overflow-hidden bg-gray-950 relative">
         <TransformWrapper
           initialScale={1}
           minScale={0.1}
           maxScale={10}
           centerOnInit
+          panning={{ disabled: activeTool !== 'pan' }}
         >
           {({ zoomIn, zoomOut, resetTransform }) => (
             <>
@@ -232,12 +456,46 @@ export default function CanvasViewer({
                   width={imageWidth}
                   height={imageHeight}
                   className="max-w-none"
+                  style={{ cursor: activeTool === 'pan' ? 'grab' : 'crosshair' }}
+                  onMouseDown={handleCanvasMouseDown}
+                  onMouseMove={handleCanvasMouseMove}
+                  onMouseUp={handleCanvasMouseUp}
                 />
               </TransformComponent>
             </>
           )}
         </TransformWrapper>
+
+        {/* Floating text input for text tool */}
+        {humanAnno.textInput && (
+          <div
+            className="absolute z-20"
+            style={{
+              left: humanAnno.textInput.screenX,
+              top: humanAnno.textInput.screenY,
+            }}
+          >
+            <input
+              ref={textInputRef}
+              type="text"
+              value={textValue}
+              onChange={(e) => setTextValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleTextConfirm();
+                if (e.key === 'Escape') {
+                  humanAnno.setTextInput(null);
+                  setTextValue('');
+                }
+              }}
+              onBlur={handleTextConfirm}
+              placeholder="Type label..."
+              className="px-2 py-1 text-sm bg-gray-900 border border-orange-500 text-orange-300 rounded outline-none min-w-[120px]"
+            />
+          </div>
+        )}
       </div>
     </div>
   );
-}
+});
+
+export default CanvasViewer;

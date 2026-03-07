@@ -1,5 +1,70 @@
 import Anthropic from '@anthropic-ai/sdk';
-import type { AgentRequest, AgentResponse } from '../../../shared/types.js';
+import fs from 'fs/promises';
+import path from 'path';
+import type { AgentRequest, AgentResponse, HumanAnnotation, COCODataset, ConversationMessage } from '../../../shared/types.js';
+import { renderTemplate } from '../prompts/renderTemplate.js';
+import { getInputsDir } from './fileService.js';
+import { enrichAnnotationsWithContext } from './spatialEnrichment.js';
+
+function formatHumanAnnotations(annotations?: HumanAnnotation[]): string {
+  if (!annotations?.length) return '';
+
+  let section = `\n## Human Annotations (User Markings on Image)\nThe user drew the following annotations on the image to guide your analysis:\n\n`;
+
+  for (const anno of annotations) {
+    switch (anno.type) {
+      case 'point':
+        section += `- **Point** at pixel (${anno.x}, ${anno.y})`;
+        if (anno.label) section += ` — label: "${anno.label}"`;
+        section += '\n';
+        break;
+      case 'line': {
+        const dx = anno.end[0] - anno.start[0];
+        const dy = anno.end[1] - anno.start[1];
+        const length = Math.sqrt(dx * dx + dy * dy);
+        section += `- **Measurement line** from (${anno.start[0]}, ${anno.start[1]}) to (${anno.end[0]}, ${anno.end[1]}) — length: ${length.toFixed(1)} px`;
+        if (anno.label) section += `, label: "${anno.label}"`;
+        section += '\n';
+        break;
+      }
+      case 'rect':
+        section += `- **Region of interest** rectangle at (${anno.x}, ${anno.y}), size ${anno.width}x${anno.height} px`;
+        if (anno.label) section += ` — label: "${anno.label}"`;
+        section += '\n';
+        break;
+      case 'text':
+        section += `- **Text note** at (${anno.x}, ${anno.y}): "${anno.text}"\n`;
+        break;
+    }
+  }
+
+  section += `
+### How to interpret these annotations
+
+These are **rough sketches communicating the user's idea**, NOT precise coordinates. Do NOT hardcode the drawn coordinates into your measurement code. Instead, use them to understand the user's **intent**:
+
+- **Line drawn across a feature** → The user wants to measure the **width or thickness** of that kind of feature. Write a generic algorithm that measures width for ALL matching annotations (e.g., minimum width via contour cross-sections), not just at the drawn line's location.
+- **Line drawn between two features** → The user wants the **distance between** those types of features. Measure it properly using contour geometry for all relevant annotation pairs.
+- **Point placed on/near a feature** → The user is identifying **which category or feature type** they care about. Process all annotations of that category.
+- **Rectangle around a region** → The user wants analysis **focused on that general area**. Filter to annotations overlapping the region.
+- **Text note** → Read it as an additional instruction.
+
+**Key principle**: The annotations tell you WHAT to measure and give a rough idea of WHERE. Your code should then apply robust geometric algorithms across ALL relevant COCO annotations of the indicated type — not just at the specific drawn coordinates.
+`;
+
+  return section;
+}
+
+function summarizeAnnotations(annotations: HumanAnnotation[]): string {
+  const counts: Record<string, number> = {};
+  for (const a of annotations) counts[a.type] = (counts[a.type] || 0) + 1;
+  const parts: string[] = [];
+  if (counts.line) parts.push(`${counts.line} line(s) sketching the general idea of what to measure`);
+  if (counts.point) parts.push(`${counts.point} point(s) indicating features of interest`);
+  if (counts.rect) parts.push(`${counts.rect} rectangle(s) highlighting regions of interest`);
+  if (counts.text) parts.push(`${counts.text} text note(s)`);
+  return `The user drew ${parts.join(', ')}`;
+}
 
 let client: Anthropic | null = null;
 
@@ -13,32 +78,117 @@ function getClient(): Anthropic {
 export async function invokeAgent(
   request: AgentRequest,
 ): Promise<AgentResponse> {
-  const systemPrompt = buildSystemPrompt(request);
-  const userMessage = buildUserMessage(request);
+  const mode = request.mode ?? 'generate';
+  console.log(`[Agent] invokeAgent mode=${mode}, prompt="${request.prompt.slice(0, 80)}..."`);
 
+  if (mode === 'chat') {
+    return invokeChatMode(request);
+  }
+
+  return invokeGenerateMode(request);
+}
+
+async function invokeGenerateMode(
+  request: AgentRequest,
+): Promise<AgentResponse> {
+  console.log(`[Agent/Generate] Building system prompt...`);
+  const systemPrompt = await buildSystemPrompt(request);
+  console.log(`[Agent/Generate] System prompt: ${systemPrompt.length} chars`);
+  const userMessageText = buildUserMessage(request);
+  console.log(`[Agent/Generate] User message: ${userMessageText.length} chars`);
+
+  // Build user content: multimodal if canvas snapshot is provided
+  const snapshotSize = request.context.canvas_snapshot?.length ?? 0;
+  if (snapshotSize > 0) {
+    console.log(`[Agent] Sending canvas snapshot: ${(snapshotSize / 1024).toFixed(0)} KB base64`);
+  }
+
+  let userContent: Anthropic.MessageCreateParams['messages'][0]['content'];
+  if (request.context.canvas_snapshot) {
+    userContent = [
+      {
+        type: 'image' as const,
+        source: {
+          type: 'base64' as const,
+          media_type: 'image/jpeg' as const,
+          data: request.context.canvas_snapshot,
+        },
+      },
+      {
+        type: 'text' as const,
+        text: 'The image above shows the canvas with COCO annotation overlays and user-drawn annotations (in orange). Use this to understand the spatial relationships between features and user annotations.\n\n' + userMessageText,
+      },
+    ];
+  } else {
+    userContent = userMessageText;
+  }
+
+  console.log(`[Agent/Generate] Calling Claude API...`);
   const response = await getClient().messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 8192,
+    model: 'claude-sonnet-4-6',
+    max_tokens: 16384,
     system: systemPrompt,
-    messages: [{ role: 'user', content: userMessage }],
+    messages: [{ role: 'user', content: userContent }],
+    thinking: { type: 'enabled', budget_tokens: 4096 },
+    stop_sequences: ['</code>'],
   });
+  console.log(`[Agent/Generate] Claude responded: ${response.usage?.input_tokens} input, ${response.usage?.output_tokens} output tokens`);
 
-  // Extract text content from response
-  const textBlock = response.content.find((b) => b.type === 'text');
-  const content = textBlock?.text || '';
+  // Extract text content from response (skip thinking blocks)
+  const textBlocks = response.content.filter((b) => b.type === 'text');
+  const content = textBlocks.map((b) => (b as Anthropic.TextBlock).text).join('');
 
-  // Extract Python code from markdown fences if present
+  // Extract Python code from <code> XML tags (preferred) or markdown fences (fallback)
+  const xmlCodeMatch = content.match(/<code>\n?([\s\S]*?)(?:<\/code>|$)/);
   const fenceMatch = content.match(/```python\n([\s\S]*?)```/);
-  const code = fenceMatch ? fenceMatch[1] : content;
+  const code = xmlCodeMatch ? xmlCodeMatch[1].trim() : fenceMatch ? fenceMatch[1] : content;
 
-  // Extract explanation (text outside the code fence)
-  const explanation = content
-    .replace(/```python\n[\s\S]*?```/, '')
-    .trim() || 'Generated by Claude.';
+  // Extract explanation from <explanation> tags, or text outside code blocks
+  const xmlExplMatch = content.match(/<explanation>([\s\S]*?)<\/explanation>/);
+  const explanation = xmlExplMatch
+    ? xmlExplMatch[1].trim()
+    : content
+        .replace(/<code>[\s\S]*?(?:<\/code>|$)/, '')
+        .replace(/```python\n[\s\S]*?```/, '')
+        .trim() || 'Generated by Claude.';
 
+  console.log(`[Agent/Generate] Done. Code: ${code.length} chars, explanation: ${explanation.length} chars`);
   return {
     code,
     explanation,
+    agent_message_id: response.id,
+  };
+}
+
+async function invokeChatMode(
+  request: AgentRequest,
+): Promise<AgentResponse> {
+  console.log(`[Agent/Chat] Building chat system prompt...`);
+  const systemPrompt = await buildChatSystemPrompt(request);
+  console.log(`[Agent/Chat] System prompt: ${systemPrompt.length} chars`);
+  const messages = buildChatMessages(request);
+  console.log(`[Agent/Chat] Conversation history: ${messages.length} messages`);
+
+  const snapshotSize = request.context.canvas_snapshot?.length ?? 0;
+  if (snapshotSize > 0) {
+    console.log(`[Agent/Chat] Sending canvas snapshot: ${(snapshotSize / 1024).toFixed(0)} KB base64`);
+  }
+
+  console.log(`[Agent/Chat] Calling Claude API...`);
+  const response = await getClient().messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 4096,
+    system: systemPrompt,
+    messages,
+  });
+  console.log(`[Agent/Chat] Claude responded: ${response.usage?.input_tokens} input, ${response.usage?.output_tokens} output tokens`);
+
+  const textBlock = response.content.find((b) => b.type === 'text');
+  const content = textBlock?.text || '';
+
+  return {
+    code: null,
+    explanation: content,
     agent_message_id: response.id,
   };
 }
@@ -67,276 +217,157 @@ function buildUserMessage(request: AgentRequest): string {
       }
       msg += '\n';
     }
+    if (ctx.human_annotations?.length) {
+      msg += `\n**IMPORTANT — Visual guidance from user**: ${summarizeAnnotations(ctx.human_annotations)}. See "Human Annotations" in system prompt for exact coordinates. These are rough sketches showing the general idea — see "Human Annotations" in system prompt.\n\n`;
+    }
     msg += `New instruction: ${request.prompt}`;
     return msg;
   }
 
-  return request.prompt;
+  let basePrompt = request.prompt;
+  if (ctx.human_annotations?.length) {
+    basePrompt += `\n\n**IMPORTANT — Visual guidance from user**: ${summarizeAnnotations(ctx.human_annotations)}. See "Human Annotations" in system prompt for exact coordinates. These are rough sketches showing the general idea — see "Human Annotations" in system prompt.`;
+  }
+  return basePrompt;
 }
 
-function buildSystemPrompt(request: AgentRequest): string {
+async function loadSessionCoco(sessionId: string): Promise<COCODataset | null> {
+  try {
+    const cocoPath = path.join(getInputsDir(sessionId), 'annotations.json');
+    const raw = await fs.readFile(cocoPath, 'utf-8');
+    return JSON.parse(raw) as COCODataset;
+  } catch {
+    return null;
+  }
+}
+
+async function buildSystemPrompt(request: AgentRequest): Promise<string> {
   const ctx = request.context;
   const rleNote =
     ctx.coco_summary.segmentation_type === 'rle'
       ? ' (RLE encoded — decode before geometric operations)'
       : '';
 
-  return `You are an expert computer vision measurement code generator for manufacturing inspection.
-Generate a single, complete Python script inside a \`\`\`python fence.
+  // Build human annotations section with spatial enrichment
+  let humanAnnotationsSection = formatHumanAnnotations(ctx.human_annotations);
 
-**Before the code fence**, write a brief explanation (2-4 sentences) of your approach: which categories/annotations you're targeting, what measurement technique you're using, and any assumptions. This helps the user understand and verify the generated code.
-
-## Generalization Principle
-**CRITICAL**: All measurement functions must be **generic and reusable** across different domains and datasets — not specific to any particular use case (e.g., battery cathode inspection, PCB defects, etc.).
-- Measurement functions must accept category names, contours, and other data as **parameters** — NEVER hardcode specific category names (like "particle_defect", "current_collector_edge", etc.) inside measurement functions.
-- Category filtering belongs in the pipeline section, not in measurement logic. The pipeline reads which categories to target from the user's prompt and passes the filtered data to generic measurement functions.
-- Name measurement functions by what they compute (e.g., \`measure_area_and_perimeter\`, \`measure_min_distance\`, \`count_by_category\`), not by domain-specific names.
-- A measurement function written for one dataset should work identically on any other dataset with similar annotation geometry.
-
-## Environment
-- INPUT_DIR and OUTPUT_DIR are pre-defined string variables pointing to absolute paths. Do NOT redefine or reassign them.
-- Available libraries: cv2 (OpenCV), numpy (as np), scipy, skimage (scikit-image), math, json, os, sys
-- Python 3.10+
-- Scripts run in an isolated namespace — do not rely on any imports being pre-loaded.
-
-## Input Files
-All input files are in INPUT_DIR:
-- \`annotations.json\` — COCO-format JSON (structure detailed below)
-- \`${ctx.image_info.filename}\` — the uploaded image (${ctx.image_info.width}x${ctx.image_info.height} pixels)
-
-## COCO Annotation Schema
-The annotations.json file has this exact structure:
-\`\`\`json
-{
-  "images": [{"id": int, "file_name": str, "width": int, "height": int}],
-  "categories": [{"id": int, "name": str, "supercategory": str}],
-  "annotations": [
-    {
-      "id": int,
-      "image_id": int,
-      "category_id": int,
-      "bbox": [x, y, w, h],
-      "area": float,
-      "segmentation": [[x1,y1,x2,y2,...]] | {"counts": str, "size": [h,w]},
-      "iscrowd": 0 | 1,
-      "score": float
+  if (ctx.human_annotations?.length) {
+    const cocoData = await loadSessionCoco(request.session_id);
+    if (cocoData) {
+      const enriched = enrichAnnotationsWithContext(ctx.human_annotations, cocoData);
+      if (enriched) {
+        humanAnnotationsSection += enriched;
+      }
     }
-  ]
+  }
+
+  return renderTemplate('agent-system.md', {
+    image_filename: ctx.image_info.filename,
+    image_width: String(ctx.image_info.width),
+    image_height: String(ctx.image_info.height),
+    annotation_count: String(ctx.coco_summary.annotation_count),
+    categories: ctx.coco_summary.categories.join(', '),
+    segmentation_type: ctx.coco_summary.segmentation_type,
+    rle_note: rleNote,
+    human_annotations_section: humanAnnotationsSection,
+  });
 }
-\`\`\`
-- **Polygon segmentation** (Array): Each element is a flat list [x1,y1,x2,y2,...]. Convert to contour: \`np.array(seg).reshape(-1, 1, 2).astype(np.int32)\`
-- **RLE segmentation** (Object with "counts"): Check type with \`isinstance(ann["segmentation"], list)\`.
-- Category lookup: \`cat_map = {c["id"]: c["name"] for c in coco["categories"]}\`
-- Filter by category: \`[a for a in coco["annotations"] if cat_map[a["category_id"]] == "target_name"]\`
 
-## Current Upload
-- Image: ${ctx.image_info.width}x${ctx.image_info.height} pixels (\`${ctx.image_info.filename}\`)
-- Total annotations: ${ctx.coco_summary.annotation_count}
-- Categories: ${ctx.coco_summary.categories.join(', ')}
-- Segmentation type: ${ctx.coco_summary.segmentation_type}${rleNote}
-
-## Measurements
-- **Spatial measurements** must be in **pixels**. Do not convert to any other unit.
-- Use \`cv2.contourArea(contour)\` for accurate polygon area (NOT the approximate \`ann["area"]\` from COCO)
-- Use \`cv2.arcLength(contour, closed=True)\` for perimeter
-- Roundness = \`4 * pi * area / perimeter**2\` (1.0 = perfect circle)
-- Use the segmentation polygon (not bbox) for precise geometric measurements whenever available
-- Name spatial measurement keys with a \`_px\` suffix, e.g. \`area_px\`, \`width_px\`, \`distance_px\`
-- Label overlay values with "px", e.g. \`f"{value:.1f} px"\`
-- **Non-spatial measurements** (counts, ratios, percentages, booleans) do NOT use the \`_px\` suffix. Use descriptive names like \`count\`, \`defect_count\`, \`density\`, \`ratio\`, etc.
-
-### Measurement Type Guidance
-Match the measurement type to what the user requests:
-- **Counting** ("count", "how many", "number of"): Use \`count\` as measurement key. Each annotation gets \`"count": 1\`. Use \`metrics\` for summary totals per category.
-- **Geometric** ("area", "size", "perimeter", "distance", "width", "length"): Use pixel-based measurements with \`_px\` suffix.
-- **Shape** ("roundness", "aspect ratio", "circularity"): Use dimensionless ratio keys without \`_px\`.
-- **Density/Distribution** ("density", "coverage", "spacing"): Use appropriate descriptive keys.
-Do NOT default to area/geometric measurements when the user asks for counts or other non-geometric analysis.
-
-## Output Format
-Write \`OUTPUT_DIR/result.json\` with exactly this JSON structure:
-\`\`\`json
-{
-  "overlays": [],
-  "metrics": {},
-  "ctq_results": [],
-  "stdout": ""
+function getTemplateVars(request: AgentRequest) {
+  const ctx = request.context;
+  const rleNote =
+    ctx.coco_summary.segmentation_type === 'rle'
+      ? ' (RLE encoded — decode before geometric operations)'
+      : '';
+  return {
+    image_filename: ctx.image_info.filename,
+    image_width: String(ctx.image_info.width),
+    image_height: String(ctx.image_info.height),
+    annotation_count: String(ctx.coco_summary.annotation_count),
+    categories: ctx.coco_summary.categories.join(', '),
+    segmentation_type: ctx.coco_summary.segmentation_type,
+    rle_note: rleNote,
+  };
 }
-\`\`\`
 
-### overlays (array)
-Visual overlays rendered on the canvas. Supported types:
+async function buildChatSystemPrompt(request: AgentRequest): Promise<string> {
+  const vars = getTemplateVars(request);
 
-**measurements** — dimension lines with labels:
-\`{"type": "measurements", "lines": [{"start": [x, y], "end": [x, y], "value": "123.4 px", "color": "#00FF00"}]}\`
+  // Build human annotations section with spatial enrichment (same as generate mode)
+  let humanAnnotationsSection = formatHumanAnnotations(request.context.human_annotations);
 
-**bboxes** — labeled rectangles:
-\`{"type": "bboxes", "boxes": [{"x": 100, "y": 100, "width": 50, "height": 30, "label": "Part A", "color": "#FF0000"}]}\`
+  if (request.context.human_annotations?.length) {
+    const cocoData = await loadSessionCoco(request.session_id);
+    if (cocoData) {
+      const enriched = enrichAnnotationsWithContext(request.context.human_annotations, cocoData);
+      if (enriched) {
+        humanAnnotationsSection += enriched;
+      }
+    }
+  }
 
-**contours** — closed polygons:
-\`{"type": "contours", "points": [[x1,y1], [x2,y2], ...], "color": "#00FFFF", "label": "outline"}\`
+  // Add previous result context if available
+  const ctx = request.context;
+  if (ctx.previous_result) {
+    let resultContext = '\n## Previous Execution Results\n';
+    if (ctx.previous_result.ctq_results?.length) {
+      resultContext += `The last code execution produced ${ctx.previous_result.ctq_results.length} CTQ results.\n`;
+      const allKeys = new Set<string>();
+      for (const r of ctx.previous_result.ctq_results) {
+        Object.keys(r.measurements).forEach((k) => allKeys.add(k));
+      }
+      if (allKeys.size > 0) {
+        resultContext += `Measurement fields: ${Array.from(allKeys).join(', ')}\n`;
+      }
+    }
+    if (ctx.previous_result.stdout) {
+      resultContext += `Stdout: ${ctx.previous_result.stdout.slice(0, 300)}\n`;
+    }
+    humanAnnotationsSection += resultContext;
+  } else if (ctx.previous_error) {
+    humanAnnotationsSection += `\n## Previous Execution Error\nThe last code execution failed with: ${ctx.previous_error.slice(0, 300)}\n`;
+  }
 
-**text** — positioned text labels:
-\`{"type": "text", "entries": [{"x": 10, "y": 30, "text": "Count: 5", "color": "#FFFFFF", "size": 14}]}\`
+  return renderTemplate('agent-chat.md', {
+    ...vars,
+    human_annotations_section: humanAnnotationsSection,
+  });
+}
 
-### metrics (object)
-Summary key-value pairs. Examples:
-- Geometric: \`{"total_features": 12, "avg_area_px": 345.6}\`
-- Counting: \`{"total_defects": 42, "particle_defect_count": 15, "scratch_defect_count": 27}\`
+function buildChatMessages(
+  request: AgentRequest,
+): Anthropic.MessageCreateParams['messages'] {
+  const messages: Anthropic.MessageCreateParams['messages'] = [];
 
-### ctq_results (array)
-Per-feature measurement results. One entry per measured feature:
-- Geometric: \`{"feature_id": 1, "label": "defect_001", "category": "particle_defect", "measurements": {"area_px": 345.6, "width_px": 21.3}}\`
-- Counting: \`{"feature_id": 1, "label": "particle_defect_001", "category": "particle_defect", "measurements": {"count": 1}}\`
-- **feature_id**: Use the annotation \`id\` from the COCO JSON so results trace back to specific annotations.
-- **label**: Use category name + sequential index (e.g., "coating_001").
-- Only include the measurements the user specifically asked for. For counting tasks, each annotation gets \`"count": 1\` and per-category totals go in \`metrics\`.
+  // Add conversation history
+  if (request.conversation_history?.length) {
+    for (const msg of request.conversation_history) {
+      messages.push({ role: msg.role, content: msg.content });
+    }
+  }
 
-## Code Structure
-Follow this pattern — use functions, not one flat script.
-**CRITICAL**: Keep pure measurement logic in standalone functions (marked with \`# --- MEASUREMENT FUNCTIONS ---\`) that are separate from I/O, overlay building, and result serialization. The measurement functions must:
-- Accept annotation data (contours, bboxes) as parameters — **never hardcode category names**
-- Return plain dicts/numbers — NO overlay construction, NO file I/O
-- Be **generic and reusable** across any COCO dataset, not tied to specific category names
-- Category-specific filtering happens ONLY in the pipeline section
+  // Build the final user message (with optional canvas snapshot)
+  let userContent: Anthropic.MessageCreateParams['messages'][0]['content'];
+  if (request.context.canvas_snapshot) {
+    userContent = [
+      {
+        type: 'image' as const,
+        source: {
+          type: 'base64' as const,
+          media_type: 'image/jpeg' as const,
+          data: request.context.canvas_snapshot,
+        },
+      },
+      {
+        type: 'text' as const,
+        text: 'The image above shows the canvas with COCO annotation overlays and user-drawn annotations (in orange).\n\n' + request.prompt,
+      },
+    ];
+  } else {
+    userContent = request.prompt;
+  }
 
-\`\`\`python
-import cv2
-import numpy as np
-import json
-import os
+  messages.push({ role: 'user', content: userContent });
 
-# --- MEASUREMENT FUNCTIONS ---
-# Generic measurement logic below. These functions accept annotation data
-# as parameters and return measurement results (spatial in pixels, counts as integers).
-# They must NOT reference specific category names — they work on any contour/bbox.
-
-def measure_area_and_shape(contour):
-    """Measure area and shape metrics for any contour. Returns a measurements dict."""
-    measurements = {}
-    # ... generic measurement logic ...
-    return measurements
-
-def count_annotations_by_category(annotations, cat_map, target_categories):
-    """Count annotations in the given categories. Works for any category names."""
-    counts = {}
-    for ann in annotations:
-        name = cat_map[ann["category_id"]]
-        if name in target_categories:
-            counts[name] = counts.get(name, 0) + 1
-    return counts
-
-# --- PIPELINE (I/O, overlays, result assembly) ---
-# Category-specific filtering and domain logic goes here.
-
-def load_data():
-    """Load image and COCO annotations."""
-    image = cv2.imread(os.path.join(INPUT_DIR, "${ctx.image_info.filename}"))
-    with open(os.path.join(INPUT_DIR, "annotations.json")) as f:
-        coco = json.load(f)
-    cat_map = {c["id"]: c["name"] for c in coco["categories"]}
-    return image, coco, cat_map
-
-def build_overlays(ctq_results, coco, cat_map):
-    """Create visual overlays from measurement results."""
-    overlays = []
-    # ... overlay construction ...
-    return overlays
-
-def main():
-    image, coco, cat_map = load_data()
-    # Filter annotations by the categories relevant to the user's request
-    target_categories = {"category_a", "category_b"}  # from user prompt
-    target_anns = [a for a in coco["annotations"] if cat_map[a["category_id"]] in target_categories]
-    ctq_results = []
-    for ann in target_anns:
-        # Extract contour from segmentation
-        # Call generic measure_*() functions
-        # Append to ctq_results
-        pass
-    overlays = build_overlays(ctq_results, coco, cat_map)
-    metrics = {}  # summary statistics
-    result = {"overlays": overlays, "metrics": metrics, "ctq_results": ctq_results, "stdout": ""}
-    with open(os.path.join(OUTPUT_DIR, "result.json"), "w") as f:
-        json.dump(result, f)
-    print(f"Processed {len(ctq_results)} features")
-
-main()
-\`\`\`
-
-## Minimum Distance Between Contours
-When measuring the minimum distance between two contours (e.g., defect to edge), **do NOT use vertex-to-vertex distance** — polygons with few vertices (like rectangles) will give wrong results (distance to a corner instead of the nearest edge).
-
-Correct approach — use \`cv2.pointPolygonTest\` for measurement AND project onto edge segments for visualization:
-\`\`\`python
-def min_distance_between_contours(contour_a, contour_b):
-    """Minimum distance between two contours in pixels."""
-    min_dist_px = float('inf')
-    points_a = contour_a.reshape(-1, 2)
-    for pt in points_a:
-        dist = abs(cv2.pointPolygonTest(contour_b, tuple(map(float, pt)), True))
-        min_dist_px = min(min_dist_px, dist)
-    # Also check reverse direction
-    points_b = contour_b.reshape(-1, 2)
-    for pt in points_b:
-        dist = abs(cv2.pointPolygonTest(contour_a, tuple(map(float, pt)), True))
-        min_dist_px = min(min_dist_px, dist)
-    return min_dist_px
-
-def closest_point_on_segment(p, a, b):
-    """Project point p onto line segment a-b, return closest point."""
-    ab = b - a
-    t = np.dot(p - a, ab) / (np.dot(ab, ab) + 1e-10)
-    t = max(0.0, min(1.0, t))
-    return a + t * ab
-
-def find_closest_points(contour_a, contour_b):
-    """Find the actual closest point pair between two contours (not just vertices)."""
-    min_dist = float('inf')
-    best_a, best_b = None, None
-    pts_a = contour_a.reshape(-1, 2).astype(np.float64)
-    pts_b = contour_b.reshape(-1, 2).astype(np.float64)
-    # Check each point of A against each edge of B
-    for pt in pts_a:
-        for j in range(len(pts_b)):
-            seg_start = pts_b[j]
-            seg_end = pts_b[(j + 1) % len(pts_b)]
-            proj = closest_point_on_segment(pt, seg_start, seg_end)
-            d = np.linalg.norm(pt - proj)
-            if d < min_dist:
-                min_dist = d
-                best_a, best_b = pt, proj
-    # Also check reverse: points of B against edges of A
-    for pt in pts_b:
-        for j in range(len(pts_a)):
-            seg_start = pts_a[j]
-            seg_end = pts_a[(j + 1) % len(pts_a)]
-            proj = closest_point_on_segment(pt, seg_start, seg_end)
-            d = np.linalg.norm(pt - proj)
-            if d < min_dist:
-                min_dist = d
-                best_a, best_b = proj, pt
-    return best_a, best_b
-\`\`\`
-Use \`find_closest_points()\` for overlay visualization so the measurement line goes to the correct location on an edge, not just a vertex.
-
-## Common Pitfalls
-- **JSON serialization**: numpy arrays and numpy integers/floats are NOT JSON-serializable. Before writing result.json, convert all values to plain Python types: use \`int(x)\`, \`float(x)\`, \`point.tolist()\`, or \`array.tolist()\`. Never put a numpy ndarray, np.int32, or np.float64 into the result dict.
-- \`cv2.pointPolygonTest(contour, pt, measureDist)\` requires \`pt\` to be a plain Python tuple of floats, e.g. \`(float(x), float(y))\`. Passing numpy integers will crash. Always cast: \`tuple(map(float, point))\`.
-- When extracting points from contours (shape \`(N,1,2)\`), flatten first: \`point = contour[i][0]\`, then cast to float tuple.
-- \`cv2.drawContours\` expects a list of contours, not a single contour.
-
-## Error Handling
-- If the image fails to load, print an error and write an empty result.json (do not crash).
-- If no annotations match the requested category, write result.json with empty arrays and a descriptive metrics entry like \`{"error": "No annotations found for category 'X'"}\`.
-- Never use \`exit()\` or \`sys.exit()\` — let the script complete naturally.
-
-## Rules
-- Only implement what the user asks for. Do not add extra measurements or features.
-- Use functions — do not write one long procedural script.
-- Add brief comments explaining measurement logic.
-- Print a one-line summary to stdout at the end.
-- All coordinates in overlays must be in pixel space (the canvas renders at image resolution).
-- All measurement values must be in pixels.
-- **Measurement functions must be generic**: no hardcoded category names inside \`# --- MEASUREMENT FUNCTIONS ---\`. Pass category names and filtered annotations from the pipeline.`;
+  return messages;
 }

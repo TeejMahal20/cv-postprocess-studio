@@ -6,11 +6,20 @@ import { imageSize } from 'image-size';
 import {
   createSession,
   ensureInputsDir,
+  ensureImagesDir,
   getInputsDir,
+  getImagesDir,
+  getSessionDir,
   sessions,
 } from '../services/fileService.js';
 import type { SessionState } from '../types.js';
-import type { COCODataset, COCOAnnotation, UploadResponse } from '../../../shared/types.js';
+import type {
+  COCODataset,
+  COCOAnnotation,
+  UploadResponse,
+  ImageEntry,
+  SwitchImageResponse,
+} from '../../../shared/types.js';
 
 export const uploadRouter = Router();
 
@@ -25,6 +34,13 @@ const uploadFields = upload.fields([
   { name: 'coco', maxCount: 1 },
   { name: 'masks', maxCount: 20 },
 ]);
+
+const folderUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024, files: 500 },
+});
+
+// --- Single image + COCO JSON upload (existing) ---
 
 uploadRouter.post('/upload', uploadFields, async (req, res, next) => {
   try {
@@ -68,6 +84,14 @@ uploadRouter.post('/upload', uploadFields, async (req, res, next) => {
 
     const cocoSummary = parseCOCOSummary(filteredCoco);
 
+    const imageEntry: ImageEntry = {
+      index: 0,
+      filename: imageFile.originalname,
+      width: imgWidth,
+      height: imgHeight,
+      annotation_count: cocoSummary.annotation_count,
+    };
+
     // Store session state
     const session: SessionState = {
       id: sessionId,
@@ -76,6 +100,9 @@ uploadRouter.post('/upload', uploadFields, async (req, res, next) => {
       cocoFile: 'annotations.json',
       cocoSummary,
       runs: [],
+      allImages: [imageEntry],
+      currentIndex: 0,
+      fullCocoPath: cocoPath,
     };
     sessions.set(sessionId, session);
 
@@ -88,6 +115,9 @@ uploadRouter.post('/upload', uploadFields, async (req, res, next) => {
       },
       coco: cocoSummary,
       additional_masks: additionalMasks,
+      image_list: [imageEntry],
+      current_index: 0,
+      total_images: 1,
     };
 
     res.json(response);
@@ -96,7 +126,191 @@ uploadRouter.post('/upload', uploadFields, async (req, res, next) => {
   }
 });
 
-// Serve uploaded files
+// --- COCO folder upload (multi-image) ---
+
+uploadRouter.post(
+  '/upload-folder',
+  folderUpload.array('files', 500),
+  async (req, res, next) => {
+    try {
+      const files = req.files as Express.Multer.File[];
+      if (!files?.length) {
+        res.status(400).json({ error: 'No files received' });
+        return;
+      }
+
+      const { images, cocoJson } = classifyFolderFiles(files);
+      if (!cocoJson) {
+        res.status(400).json({ error: 'No valid COCO JSON found in folder' });
+        return;
+      }
+      if (images.length === 0) {
+        res.status(400).json({ error: 'No image files found in folder' });
+        return;
+      }
+
+      const fullCoco: COCODataset = JSON.parse(
+        cocoJson.buffer.toString('utf-8'),
+      );
+
+      // Create session
+      const sessionId = createSession();
+      const inputsDir = await ensureInputsDir(sessionId);
+      const imagesDir = await ensureImagesDir(sessionId);
+
+      // Write full COCO to session dir
+      const fullCocoPath = path.join(getSessionDir(sessionId), 'full_coco.json');
+      await fs.writeFile(fullCocoPath, JSON.stringify(fullCoco, null, 2));
+
+      // Write all images to images/ dir and build ImageEntry list
+      const imageEntries: ImageEntry[] = [];
+      for (const imgFile of images) {
+        const basename = path.basename(imgFile.originalname);
+        await fs.writeFile(path.join(imagesDir, basename), imgFile.buffer);
+
+        const dims = imageSize(imgFile.buffer);
+        const cocoImage = matchImageToCoco(basename, imgFile.originalname, fullCoco.images || []);
+        const annotationCount = cocoImage
+          ? (fullCoco.annotations || []).filter((a) => a.image_id === cocoImage.id).length
+          : 0;
+
+        imageEntries.push({
+          index: 0, // assigned after sort
+          filename: basename,
+          width: dims.width || 0,
+          height: dims.height || 0,
+          annotation_count: annotationCount,
+        });
+      }
+
+      // Sort by filename for deterministic order, assign indices
+      imageEntries.sort((a, b) => a.filename.localeCompare(b.filename));
+      imageEntries.forEach((e, i) => (e.index = i));
+
+      // Activate the first image
+      const firstImage = imageEntries[0];
+      await fs.copyFile(
+        path.join(imagesDir, firstImage.filename),
+        path.join(inputsDir, firstImage.filename),
+      );
+      const filteredCoco = filterCocoForImage(fullCoco, firstImage.filename);
+      await fs.writeFile(
+        path.join(inputsDir, 'annotations.json'),
+        JSON.stringify(filteredCoco, null, 2),
+      );
+
+      const cocoSummary = parseCOCOSummary(filteredCoco);
+
+      const session: SessionState = {
+        id: sessionId,
+        createdAt: new Date(),
+        imageFile: firstImage.filename,
+        cocoFile: 'annotations.json',
+        cocoSummary,
+        runs: [],
+        allImages: imageEntries,
+        currentIndex: 0,
+        fullCocoPath,
+      };
+      sessions.set(sessionId, session);
+
+      const response: UploadResponse = {
+        session_id: sessionId,
+        image: {
+          filename: firstImage.filename,
+          width: firstImage.width,
+          height: firstImage.height,
+        },
+        coco: cocoSummary,
+        additional_masks: [],
+        image_list: imageEntries,
+        current_index: 0,
+        total_images: imageEntries.length,
+      };
+
+      res.json(response);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+// --- Switch active image within a multi-image session ---
+
+uploadRouter.post(
+  '/sessions/:sessionId/switch-image',
+  async (req, res, next) => {
+    try {
+      const { sessionId } = req.params;
+      const { index } = req.body as { index: number };
+
+      const session = sessions.get(sessionId);
+      if (!session) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+      }
+
+      if (
+        !session.allImages ||
+        index < 0 ||
+        index >= session.allImages.length
+      ) {
+        res.status(400).json({ error: 'Invalid image index' });
+        return;
+      }
+
+      const targetImage = session.allImages[index];
+      const inputsDir = getInputsDir(sessionId);
+      const imagesDir = getImagesDir(sessionId);
+
+      // Clear current inputs (except config.json)
+      const existingFiles = await fs.readdir(inputsDir);
+      for (const file of existingFiles) {
+        if (file !== 'config.json') {
+          await fs.unlink(path.join(inputsDir, file));
+        }
+      }
+
+      // Copy new image into inputs
+      await fs.copyFile(
+        path.join(imagesDir, targetImage.filename),
+        path.join(inputsDir, targetImage.filename),
+      );
+
+      // Filter and write annotations
+      const fullCocoRaw = await fs.readFile(session.fullCocoPath, 'utf-8');
+      const fullCoco: COCODataset = JSON.parse(fullCocoRaw);
+      const filteredCoco = filterCocoForImage(fullCoco, targetImage.filename);
+      await fs.writeFile(
+        path.join(inputsDir, 'annotations.json'),
+        JSON.stringify(filteredCoco, null, 2),
+      );
+
+      // Update session state
+      const cocoSummary = parseCOCOSummary(filteredCoco);
+      session.imageFile = targetImage.filename;
+      session.cocoSummary = cocoSummary;
+      session.currentIndex = index;
+
+      const response: SwitchImageResponse = {
+        image: {
+          filename: targetImage.filename,
+          width: targetImage.width,
+          height: targetImage.height,
+        },
+        coco: cocoSummary,
+        filtered_coco: filteredCoco,
+      };
+
+      res.json(response);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+// --- Serve uploaded files from inputs/ ---
+
 uploadRouter.get(
   '/workspace/:sessionId/files/:filename',
   async (req, res, next) => {
@@ -119,6 +333,88 @@ uploadRouter.get(
     }
   },
 );
+
+// --- Serve images from the images/ subdir (multi-image sessions) ---
+
+uploadRouter.get(
+  '/workspace/:sessionId/images/:filename',
+  async (req, res, next) => {
+    try {
+      const { sessionId, filename } = req.params;
+      const filePath = path.join(getImagesDir(sessionId), filename);
+
+      const resolvedPath = path.resolve(filePath);
+      const resolvedDir = path.resolve(getImagesDir(sessionId));
+      if (!resolvedPath.startsWith(resolvedDir)) {
+        res.status(403).json({ error: 'Forbidden' });
+        return;
+      }
+
+      await fs.access(filePath);
+      res.sendFile(resolvedPath);
+    } catch {
+      res.status(404).json({ error: 'File not found' });
+    }
+  },
+);
+
+// --- Helpers ---
+
+function classifyFolderFiles(files: Express.Multer.File[]): {
+  images: Express.Multer.File[];
+  cocoJson: Express.Multer.File | null;
+} {
+  const IMAGE_EXTS = /\.(png|jpe?g|tiff?|bmp|webp)$/i;
+  const images: Express.Multer.File[] = [];
+  let cocoJson: Express.Multer.File | null = null;
+
+  for (const file of files) {
+    const basename = path.basename(file.originalname);
+    if (IMAGE_EXTS.test(basename)) {
+      images.push(file);
+    } else if (basename.endsWith('.json')) {
+      try {
+        const parsed = JSON.parse(file.buffer.toString('utf-8'));
+        if (parsed.images && parsed.annotations && parsed.categories) {
+          // Pick the largest valid COCO JSON if multiple exist
+          if (
+            !cocoJson ||
+            file.buffer.length > cocoJson.buffer.length
+          ) {
+            cocoJson = file;
+          }
+        }
+      } catch {
+        // not valid JSON, skip
+      }
+    }
+  }
+
+  return { images, cocoJson };
+}
+
+function matchImageToCoco(
+  imageBasename: string,
+  imageRelPath: string,
+  cocoImages: COCODataset['images'],
+) {
+  // Try exact basename match
+  let match = cocoImages.find(
+    (ci) => path.basename(ci.file_name) === imageBasename,
+  );
+  if (match) return match;
+
+  // Try matching against the full relative path
+  const normalizedRel = imageRelPath.replace(/\\/g, '/');
+  match = cocoImages.find((ci) => {
+    const normalizedCoco = ci.file_name.replace(/\\/g, '/');
+    return (
+      normalizedRel.endsWith(normalizedCoco) ||
+      normalizedCoco.endsWith(imageBasename)
+    );
+  });
+  return match;
+}
 
 function parseCOCOSummary(coco: COCODataset) {
   const categories = (coco.categories || []).map((c) => ({
@@ -164,9 +460,11 @@ function filterCocoForImage(
   coco: COCODataset,
   imageFilename: string,
 ): COCODataset {
-  // Find the image entry matching the uploaded filename
+  // Find the image entry matching the filename (try exact then basename)
   const matchedImage = (coco.images || []).find(
-    (img) => img.file_name === imageFilename,
+    (img) =>
+      img.file_name === imageFilename ||
+      path.basename(img.file_name) === imageFilename,
   );
 
   if (!matchedImage) {
@@ -176,7 +474,7 @@ function filterCocoForImage(
 
   const imageId = matchedImage.id;
   return {
-    images: [matchedImage],
+    images: [{ ...matchedImage, file_name: path.basename(matchedImage.file_name) }],
     categories: coco.categories || [],
     annotations: (coco.annotations || []).filter(
       (ann) => ann.image_id === imageId,

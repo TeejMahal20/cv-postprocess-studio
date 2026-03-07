@@ -10,6 +10,13 @@ interface CTQResultsTableProps {
 type SortKey = 'feature_id' | 'label' | string;
 type SortDir = 'asc' | 'desc';
 
+/** Safely format a measurement value that may be a number, string, or other type */
+function formatVal(v: unknown, decimals: number): string {
+  if (v == null) return '-';
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n.toFixed(decimals) : String(v);
+}
+
 export default function CTQResultsTable({
   results,
   onHighlightFeature,
@@ -22,8 +29,10 @@ export default function CTQResultsTable({
   const measurementKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const r of results) {
-      for (const k of Object.keys(r.measurements)) {
-        keys.add(k);
+      if (r.measurements && typeof r.measurements === 'object') {
+        for (const k of Object.keys(r.measurements)) {
+          keys.add(k);
+        }
       }
     }
     return Array.from(keys);
@@ -38,10 +47,10 @@ export default function CTQResultsTable({
       if (sortKey === 'feature_id') {
         cmp = a.feature_id - b.feature_id;
       } else if (sortKey === 'label') {
-        cmp = a.label.localeCompare(b.label);
+        cmp = (a.label || '').localeCompare(b.label || '');
       } else {
-        const av = a.measurements[sortKey] ?? -Infinity;
-        const bv = b.measurements[sortKey] ?? -Infinity;
+        const av = Number(a.measurements?.[sortKey]) || -Infinity;
+        const bv = Number(b.measurements?.[sortKey]) || -Infinity;
         cmp = av - bv;
       }
       return sortDir === 'asc' ? cmp : -cmp;
@@ -55,7 +64,10 @@ export default function CTQResultsTable({
     const sums: Record<string, number> = {};
     const counts: Record<string, number> = {};
     for (const r of results) {
-      for (const [k, v] of Object.entries(r.measurements)) {
+      if (!r.measurements || typeof r.measurements !== 'object') continue;
+      for (const [k, raw] of Object.entries(r.measurements)) {
+        const v = typeof raw === 'number' ? raw : Number(raw);
+        if (!Number.isFinite(v)) continue;
         sums[k] = (sums[k] || 0) + v;
         counts[k] = (counts[k] || 0) + 1;
       }
@@ -86,7 +98,7 @@ export default function CTQResultsTable({
       r.label,
       r.category || '',
       ...measurementKeys.map((k) =>
-        r.measurements[k] !== undefined ? r.measurements[k].toFixed(4) : '',
+        r.measurements?.[k] != null ? formatVal(r.measurements[k], 4) : '',
       ),
     ]);
     const csv = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
@@ -159,13 +171,13 @@ export default function CTQResultsTable({
                 <td className="px-2 py-1.5 text-gray-400">{r.feature_id}</td>
                 <td className="px-2 py-1.5 text-gray-300">{r.label}</td>
                 {measurementKeys.map((k) => {
-                  const val = r.measurements[k];
+                  const val = r.measurements?.[k];
                   return (
                     <td
                       key={k}
                       className="px-2 py-1.5 font-mono text-gray-300"
                     >
-                      {val !== undefined ? val.toFixed(3) : '-'}
+                      {formatVal(val, 3)}
                     </td>
                   );
                 })}
@@ -178,7 +190,7 @@ export default function CTQResultsTable({
               </td>
               {measurementKeys.map((k) => (
                 <td key={k} className="px-2 py-1.5 font-mono text-gray-400">
-                  {averages[k] !== undefined ? averages[k].toFixed(3) : '-'}
+                  {formatVal(averages[k], 3)}
                 </td>
               ))}
             </tr>

@@ -1,14 +1,19 @@
+import type { RefObject } from 'react';
 import type {
   UploadResponse,
   COCODataset,
   CalibrationConfig,
   ExecuteResponse,
   RecipeListItem,
+  HumanAnnotation,
+  DrawingTool,
+  ImageEntry,
 } from '../../../shared/types';
 import type { ChatMessage } from '../types';
 import UploadPanel from './UploadPanel';
 import CalibrationSettings from './CalibrationSettings';
 import CanvasViewer from './CanvasViewer';
+import type { CanvasViewerHandle } from './CanvasViewer';
 import AgentPanel from './AgentPanel';
 import CTQResultsTable from './CTQResultsTable';
 
@@ -33,6 +38,7 @@ interface LayoutProps {
   chatHistory: ChatMessage[];
   onGenerate: (prompt: string) => Promise<void>;
   onGenerateAndRun: (prompt: string) => Promise<void>;
+  onChat: (prompt: string) => Promise<void>;
   onRun: () => void;
   onClearHistory: () => void;
   // Recipe props
@@ -43,6 +49,25 @@ interface LayoutProps {
   onDeleteRecipe: (id: string) => void;
   onDownloadRecipe: (id: string) => void;
   onPromoteRecipe: (id: string, name: string) => void;
+  // Annotation props
+  humanAnnotations: HumanAnnotation[];
+  onAddAnnotation: (anno: HumanAnnotation) => void;
+  onUndoAnnotation: () => void;
+  onClearAnnotations: () => void;
+  activeTool: DrawingTool;
+  onSetActiveTool: (tool: DrawingTool) => void;
+  // Multi-image props
+  imageList: ImageEntry[];
+  setImageList: (list: ImageEntry[]) => void;
+  currentImageIndex: number;
+  setCurrentImageIndex: (index: number) => void;
+  onSwitchImage: (index: number) => void;
+  isSwitchingImage: boolean;
+  // Canvas ref for snapshot capture
+  canvasRef: RefObject<CanvasViewerHandle>;
+  // Snapshot mode toggle
+  snapshotMode: 'annotations' | 'full';
+  setSnapshotMode: (mode: 'annotations' | 'full') => void;
 }
 
 export default function Layout({
@@ -65,6 +90,7 @@ export default function Layout({
   chatHistory,
   onGenerate,
   onGenerateAndRun,
+  onChat,
   onRun,
   onClearHistory,
   recipes,
@@ -74,6 +100,21 @@ export default function Layout({
   onDeleteRecipe,
   onDownloadRecipe,
   onPromoteRecipe,
+  humanAnnotations,
+  onAddAnnotation,
+  onUndoAnnotation,
+  onClearAnnotations,
+  activeTool,
+  onSetActiveTool,
+  imageList,
+  setImageList,
+  currentImageIndex,
+  setCurrentImageIndex,
+  onSwitchImage,
+  isSwitchingImage,
+  canvasRef,
+  snapshotMode,
+  setSnapshotMode,
 }: LayoutProps) {
   return (
     <div className="h-screen flex flex-col bg-gray-900 text-gray-100">
@@ -95,6 +136,8 @@ export default function Layout({
             uploadResult={uploadResult}
             setUploadResult={setUploadResult}
             setCocoData={setCocoData}
+            setImageList={setImageList}
+            setCurrentImageIndex={setCurrentImageIndex}
           />
           <CalibrationSettings
             calibration={calibration}
@@ -107,6 +150,7 @@ export default function Layout({
           {uploadResult && sessionId ? (
             <>
               <CanvasViewer
+                ref={canvasRef}
                 sessionId={sessionId}
                 imageFilename={uploadResult.image.filename}
                 imageWidth={uploadResult.image.width}
@@ -114,6 +158,16 @@ export default function Layout({
                 cocoData={cocoData}
                 executionResult={executionResult}
                 highlightedFeature={highlightedFeature}
+                humanAnnotations={humanAnnotations}
+                onAddAnnotation={onAddAnnotation}
+                onUndoAnnotation={onUndoAnnotation}
+                onClearAnnotations={onClearAnnotations}
+                activeTool={activeTool}
+                onSetActiveTool={onSetActiveTool}
+                imageList={imageList}
+                currentImageIndex={currentImageIndex}
+                onSwitchImage={onSwitchImage}
+                isSwitchingImage={isSwitchingImage}
               />
               {/* Bottom results area */}
               {executionResult?.success && executionResult.result && (
@@ -134,7 +188,7 @@ export default function Layout({
                   Upload an image and COCO JSON to begin
                 </p>
                 <p className="text-sm mt-1">
-                  Drag and drop files into the left panel
+                  Drag and drop files into the left panel, or upload a COCO folder
                 </p>
               </div>
             </div>
@@ -156,6 +210,7 @@ export default function Layout({
               chatHistory={chatHistory}
               onGenerate={onGenerate}
               onGenerateAndRun={onGenerateAndRun}
+              onChat={onChat}
               onRun={onRun}
               onClearHistory={onClearHistory}
               recipes={recipes}
@@ -165,6 +220,8 @@ export default function Layout({
               onDeleteRecipe={onDeleteRecipe}
               onDownloadRecipe={onDownloadRecipe}
               onPromoteRecipe={onPromoteRecipe}
+              snapshotMode={snapshotMode}
+              setSnapshotMode={setSnapshotMode}
             />
           ) : (
             <p className="text-sm text-gray-600">

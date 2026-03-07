@@ -6,6 +6,7 @@ import type {
   MeasurementOverlay,
   BboxOverlay,
   ContourOverlay,
+  PolylineOverlay,
   TextOverlay,
   MaskOverlay,
 } from '../../../shared/types';
@@ -116,6 +117,9 @@ export function drawResultOverlays(
         break;
       case 'contours':
         drawContours(ctx, overlay);
+        break;
+      case 'polyline':
+        drawPolyline(ctx, overlay);
         break;
       case 'text':
         drawTextOverlay(ctx, overlay);
@@ -235,6 +239,38 @@ function drawContours(
     ctx.font = '11px sans-serif';
     ctx.textAlign = 'center';
     ctx.fillText(overlay.label, cx, cy);
+  }
+  ctx.restore();
+}
+
+function drawPolyline(
+  ctx: CanvasRenderingContext2D,
+  overlay: PolylineOverlay,
+) {
+  if (overlay.points.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = overlay.color;
+  ctx.lineWidth = overlay.width ?? 2;
+  if (overlay.dashed) ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(overlay.points[0][0], overlay.points[0][1]);
+  for (let i = 1; i < overlay.points.length; i++) {
+    ctx.lineTo(overlay.points[i][0], overlay.points[i][1]);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  if (overlay.label) {
+    const mid = Math.floor(overlay.points.length / 2);
+    const [mx, my] = overlay.points[mid];
+    ctx.fillStyle = '#000000CC';
+    ctx.font = 'bold 11px monospace';
+    const metrics = ctx.measureText(overlay.label);
+    ctx.fillRect(mx - metrics.width / 2 - 3, my - 18, metrics.width + 6, 15);
+    ctx.fillStyle = overlay.color;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(overlay.label, mx, my - 10);
   }
   ctx.restore();
 }

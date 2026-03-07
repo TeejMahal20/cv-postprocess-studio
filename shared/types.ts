@@ -30,6 +30,14 @@ export interface COCODataset {
 }
 
 // --- Upload Types ---
+export interface ImageEntry {
+  index: number;
+  filename: string;
+  width: number;
+  height: number;
+  annotation_count: number;
+}
+
 export interface UploadResponse {
   session_id: string;
   image: { filename: string; width: number; height: number };
@@ -41,6 +49,16 @@ export interface UploadResponse {
     has_scores: boolean;
   };
   additional_masks: string[];
+  // Multi-image support
+  image_list: ImageEntry[];
+  current_index: number;
+  total_images: number;
+}
+
+export interface SwitchImageResponse {
+  image: { filename: string; width: number; height: number };
+  coco: UploadResponse['coco'];
+  filtered_coco: COCODataset;
 }
 
 // --- Calibration ---
@@ -51,9 +69,16 @@ export interface CalibrationConfig {
 }
 
 // --- Agent Types ---
+export interface ConversationMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
 export interface AgentRequest {
   prompt: string;
   session_id: string;
+  mode?: 'generate' | 'chat'; // default 'generate'
+  conversation_history?: ConversationMessage[];
   context: {
     image_info: { width: number; height: number; filename: string };
     coco_summary: {
@@ -66,11 +91,13 @@ export interface AgentRequest {
     previous_code: string | null;
     previous_result: ExecuteResult | null;
     previous_error: string | null;
+    human_annotations?: HumanAnnotation[];
+    canvas_snapshot?: string; // base64 JPEG of canvas (annotations-only or full)
   };
 }
 
 export interface AgentResponse {
-  code: string;
+  code: string | null;
   explanation: string;
   agent_message_id: string;
 }
@@ -111,6 +138,15 @@ export interface ContourOverlay {
   label: string;
 }
 
+export interface PolylineOverlay {
+  type: 'polyline';
+  points: [number, number][];
+  color: string;
+  width?: number;
+  dashed?: boolean;
+  label?: string;
+}
+
 export interface MeasurementOverlay {
   type: 'measurements';
   lines: Array<{
@@ -136,6 +172,7 @@ export type ResultOverlay =
   | MaskOverlay
   | BboxOverlay
   | ContourOverlay
+  | PolylineOverlay
   | MeasurementOverlay
   | TextOverlay;
 
@@ -222,6 +259,49 @@ export interface RunHistoryEntry {
   ctq_count: number;
   metrics_summary: Record<string, unknown> | null;
 }
+
+// --- Human Annotation Types ---
+export interface PointAnnotation {
+  type: 'point';
+  id: string;
+  x: number;
+  y: number;
+  label?: string;
+}
+
+export interface LineAnnotation {
+  type: 'line';
+  id: string;
+  start: [number, number];
+  end: [number, number];
+  label?: string;
+}
+
+export interface RectAnnotation {
+  type: 'rect';
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  label?: string;
+}
+
+export interface TextAnnotation {
+  type: 'text';
+  id: string;
+  x: number;
+  y: number;
+  text: string;
+}
+
+export type HumanAnnotation =
+  | PointAnnotation
+  | LineAnnotation
+  | RectAnnotation
+  | TextAnnotation;
+
+export type DrawingTool = 'pan' | 'point' | 'line' | 'rect' | 'text';
 
 // --- Promotion Types ---
 export interface PromoteRequest {

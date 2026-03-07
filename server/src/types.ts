@@ -1,4 +1,4 @@
-import type { ExecuteResult } from '../../shared/types.js';
+import type { ExecuteResult, ImageEntry } from '../../shared/types.js';
 
 export interface SessionState {
   id: string;
@@ -13,6 +13,10 @@ export interface SessionState {
     has_scores: boolean;
   };
   runs: RunState[];
+  // Multi-image support
+  allImages: ImageEntry[];
+  currentIndex: number;
+  fullCocoPath: string;
 }
 
 export interface RunState {

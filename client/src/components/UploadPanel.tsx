@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback } from 'react';
-import { Upload, FileImage, FileJson, CheckCircle } from 'lucide-react';
-import { uploadFiles, getFileUrl } from '../api';
-import type { UploadResponse, COCODataset } from '../../../shared/types';
+import { Upload, FileImage, FileJson, FolderOpen, CheckCircle } from 'lucide-react';
+import { uploadFiles, uploadFolder, getFileUrl } from '../api';
+import type { UploadResponse, COCODataset, ImageEntry } from '../../../shared/types';
 
 interface UploadPanelProps {
   sessionId: string | null;
@@ -9,6 +9,8 @@ interface UploadPanelProps {
   uploadResult: UploadResponse | null;
   setUploadResult: (r: UploadResponse) => void;
   setCocoData: (d: COCODataset) => void;
+  setImageList: (list: ImageEntry[]) => void;
+  setCurrentImageIndex: (index: number) => void;
 }
 
 export default function UploadPanel({
@@ -17,6 +19,8 @@ export default function UploadPanel({
   uploadResult,
   setUploadResult,
   setCocoData,
+  setImageList,
+  setCurrentImageIndex,
 }: UploadPanelProps) {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [cocoFile, setCocoFile] = useState<File | null>(null);
@@ -25,6 +29,7 @@ export default function UploadPanel({
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cocoInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -65,10 +70,38 @@ export default function UploadPanel({
       const result = await uploadFiles(imageFile, cocoFile);
       setUploadResult(result);
       setSessionId(result.session_id);
+      setImageList(result.image_list);
+      setCurrentImageIndex(result.current_index);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Upload failed');
     } finally {
       setIsUploading(false);
+    }
+  };
+
+  const handleFolderUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    setIsUploading(true);
+    setError(null);
+    try {
+      const result = await uploadFolder(files);
+      setUploadResult(result);
+      setSessionId(result.session_id);
+      setImageList(result.image_list);
+      setCurrentImageIndex(result.current_index);
+
+      // Fetch filtered COCO for the first image from server
+      const response = await fetch(getFileUrl(result.session_id, 'annotations.json'));
+      const filteredCoco: COCODataset = await response.json();
+      setCocoData(filteredCoco);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Folder upload failed');
+    } finally {
+      setIsUploading(false);
+      // Reset the input so re-selecting the same folder works
+      if (folderInputRef.current) folderInputRef.current.value = '';
     }
   };
 
@@ -143,6 +176,33 @@ export default function UploadPanel({
         {isUploading ? 'Uploading...' : 'Upload'}
       </button>
 
+      {/* Folder upload */}
+      <div className="relative">
+        <div className="absolute inset-0 flex items-center">
+          <div className="w-full border-t border-gray-700" />
+        </div>
+        <div className="relative flex justify-center">
+          <span className="bg-gray-850 px-2 text-xs text-gray-500">or</span>
+        </div>
+      </div>
+
+      <button
+        onClick={() => folderInputRef.current?.click()}
+        disabled={isUploading}
+        className="w-full py-2 px-4 rounded border border-gray-600 hover:border-gray-500 hover:bg-gray-800 disabled:opacity-50 text-sm font-medium transition-colors flex items-center justify-center gap-2"
+      >
+        <FolderOpen className="w-4 h-4" />
+        {isUploading ? 'Uploading...' : 'Upload COCO folder'}
+      </button>
+      <input
+        ref={folderInputRef}
+        type="file"
+        // @ts-expect-error webkitdirectory is not in standard HTMLInputElement types
+        webkitdirectory=""
+        className="hidden"
+        onChange={handleFolderUpload}
+      />
+
       {error && (
         <p className="text-sm text-red-400">{error}</p>
       )}
@@ -152,7 +212,11 @@ export default function UploadPanel({
         <div className="space-y-3 border-t border-gray-700 pt-3">
           <div className="flex items-center gap-2 text-green-400 text-sm">
             <CheckCircle className="w-4 h-4" />
-            <span>Uploaded successfully</span>
+            <span>
+              {uploadResult.total_images > 1
+                ? `Uploaded ${uploadResult.total_images} images`
+                : 'Uploaded successfully'}
+            </span>
           </div>
 
           {/* Thumbnail */}
@@ -164,7 +228,7 @@ export default function UploadPanel({
 
           <div className="text-xs text-gray-400 space-y-1">
             <p>
-              Image: {uploadResult.image.width} x {uploadResult.image.height}
+              {uploadResult.image.filename} ({uploadResult.image.width} x {uploadResult.image.height})
             </p>
             <p>Annotations: {uploadResult.coco.annotation_count}</p>
             <p>Segmentation: {uploadResult.coco.segmentation_type}</p>

@@ -25,6 +25,16 @@ export function getInputsDir(sessionId: string): string {
   return path.join(WORKSPACE_DIR, sessionId, 'inputs');
 }
 
+export function getImagesDir(sessionId: string): string {
+  return path.join(WORKSPACE_DIR, sessionId, 'images');
+}
+
+export async function ensureImagesDir(sessionId: string): Promise<string> {
+  const dir = getImagesDir(sessionId);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
 export function getSession(sessionId: string): SessionState | undefined {
   return sessions.get(sessionId);
 }

@@ -1,6 +1,7 @@
 import axios from 'axios';
 import type {
   UploadResponse,
+  SwitchImageResponse,
   AgentRequest,
   AgentResponse,
   ExecuteRequest,
@@ -44,6 +45,30 @@ export async function executeCode(
 
 export function getFileUrl(sessionId: string, filename: string): string {
   return `/api/workspace/${sessionId}/files/${filename}`;
+}
+
+export function getImageUrl(sessionId: string, filename: string): string {
+  return `/api/workspace/${sessionId}/images/${filename}`;
+}
+
+export async function uploadFolder(files: File[]): Promise<UploadResponse> {
+  const form = new FormData();
+  for (const file of files) {
+    form.append('files', file, (file as any).webkitRelativePath || file.name);
+  }
+  const { data } = await api.post<UploadResponse>('/upload-folder', form);
+  return data;
+}
+
+export async function switchImage(
+  sessionId: string,
+  index: number,
+): Promise<SwitchImageResponse> {
+  const { data } = await api.post<SwitchImageResponse>(
+    `/sessions/${sessionId}/switch-image`,
+    { index },
+  );
+  return data;
 }
 
 export function getOutputUrl(

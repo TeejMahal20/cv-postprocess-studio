@@ -21,6 +21,17 @@ export function useExecution() {
         });
         setResult(response);
         return response;
+      } catch (err) {
+        console.error('[useExecution] execute error:', err);
+        const errorResponse: ExecuteResponse = {
+          success: false,
+          error: err instanceof Error ? err.message : 'Execution request failed',
+          execution_time_ms: 0,
+          run_id: '',
+          output_files: [],
+        };
+        setResult(errorResponse);
+        return errorResponse;
       } finally {
         setIsExecuting(false);
       }
