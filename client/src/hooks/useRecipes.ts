@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
+import type { AxiosError } from 'axios';
 import type {
   Recipe,
   RecipeListItem,
@@ -66,7 +67,10 @@ export function useRecipes() {
         setPromoteStatus({ state: 'success', result });
         return result;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Promotion failed';
+        const axErr = err as AxiosError<{ error?: string }>;
+        const msg =
+          axErr.response?.data?.error ||
+          (err instanceof Error ? err.message : 'Promotion failed');
         setPromoteStatus({ state: 'error', error: msg });
         throw err;
       }

@@ -31,5 +31,6 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'error' | 'system';
   content: string;
   code?: string;
+  thinking?: string;
   timestamp: number;
 }

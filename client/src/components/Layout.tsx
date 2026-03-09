@@ -68,6 +68,9 @@ interface LayoutProps {
   // Snapshot mode toggle
   snapshotMode: 'annotations' | 'full';
   setSnapshotMode: (mode: 'annotations' | 'full') => void;
+  // Thinking mode toggle
+  thinkingMode: 'auto' | 'on' | 'off';
+  setThinkingMode: (mode: 'auto' | 'on' | 'off') => void;
 }
 
 export default function Layout({
@@ -115,6 +118,8 @@ export default function Layout({
   canvasRef,
   snapshotMode,
   setSnapshotMode,
+  thinkingMode,
+  setThinkingMode,
 }: LayoutProps) {
   return (
     <div className="h-screen flex flex-col bg-gray-900 text-gray-100">
@@ -222,6 +227,8 @@ export default function Layout({
               onPromoteRecipe={onPromoteRecipe}
               snapshotMode={snapshotMode}
               setSnapshotMode={setSnapshotMode}
+              thinkingMode={thinkingMode}
+              setThinkingMode={setThinkingMode}
             />
           ) : (
             <p className="text-sm text-gray-600">

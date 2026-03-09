@@ -10,6 +10,7 @@ import {
   History,
   Image,
   Layers,
+  Brain,
 } from 'lucide-react';
 import type {
   UploadResponse,
@@ -53,10 +54,19 @@ interface AgentPanelProps {
   // Snapshot mode
   snapshotMode: 'annotations' | 'full';
   setSnapshotMode: (mode: 'annotations' | 'full') => void;
+  // Thinking mode
+  thinkingMode: 'auto' | 'on' | 'off';
+  setThinkingMode: (mode: 'auto' | 'on' | 'off') => void;
 }
 
-function ChatBubble({ message }: { message: ChatMessage }) {
-  const [expanded, setExpanded] = useState(false);
+function ChatBubble({ message, isStreaming }: { message: ChatMessage; isStreaming?: boolean }) {
+  const [codeExpanded, setCodeExpanded] = useState(false);
+  const [thinkingManualToggle, setThinkingManualToggle] = useState<boolean | null>(null);
+
+  // Auto-expand while streaming thinking, auto-collapse once code arrives.
+  // User can override by clicking the toggle.
+  const isThinkingPhase = isStreaming && message.thinking && !message.code;
+  const thinkingExpanded = thinkingManualToggle ?? !!isThinkingPhase;
 
   const bubbleClass =
     message.role === 'user'
@@ -73,23 +83,44 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   return (
     <div className={`p-2 rounded text-xs ${bubbleClass}`}>
       <span className="text-gray-500 capitalize text-[10px]">{roleLabel}</span>
+      {message.thinking && (
+        <div className="mt-1">
+          <button
+            onClick={() => setThinkingManualToggle((v) => !(v ?? isThinkingPhase))}
+            className="text-[10px] text-purple-400/70 hover:text-purple-300 flex items-center gap-1 mb-1"
+          >
+            {thinkingExpanded ? (
+              <ChevronDown className="w-3 h-3" />
+            ) : (
+              <ChevronRight className="w-3 h-3" />
+            )}
+            <Brain className="w-3 h-3" />
+            Reasoning
+          </button>
+          {thinkingExpanded && (
+            <pre className="text-[10px] bg-purple-950/30 border border-purple-900/30 p-2 rounded overflow-auto max-h-[200px] text-gray-400 whitespace-pre-wrap">
+              {message.thinking}
+            </pre>
+          )}
+        </div>
+      )}
       {message.content && (
         <p className="mt-0.5 text-gray-300 whitespace-pre-wrap">{message.content}</p>
       )}
       {message.code && (
         <div className="mt-1.5">
           <button
-            onClick={() => setExpanded((v) => !v)}
+            onClick={() => setCodeExpanded((v) => !v)}
             className="text-[10px] text-gray-500 hover:text-gray-300 flex items-center gap-1 mb-1"
           >
-            {expanded ? (
+            {codeExpanded ? (
               <ChevronDown className="w-3 h-3" />
             ) : (
               <ChevronRight className="w-3 h-3" />
             )}
             Generated code ({message.code.split('\n').length} lines)
           </button>
-          {expanded && (
+          {codeExpanded && (
             <pre className="text-[10px] bg-gray-900 p-2 rounded overflow-auto max-h-[200px] text-gray-400">
               {message.code}
             </pre>
@@ -129,6 +160,8 @@ export default function AgentPanel({
   onPromoteRecipe,
   snapshotMode,
   setSnapshotMode,
+  thinkingMode,
+  setThinkingMode,
 }: AgentPanelProps) {
   const [prompt, setPrompt] = useState('');
   const [showRecipes, setShowRecipes] = useState(false);
@@ -263,7 +296,11 @@ export default function AgentPanel({
           </div>
           <div className="space-y-2 max-h-[350px] overflow-y-auto">
             {chatHistory.map((msg, i) => (
-              <ChatBubble key={i} message={msg} />
+              <ChatBubble
+                key={i}
+                message={msg}
+                isStreaming={isGenerating && i === chatHistory.length - 1}
+              />
             ))}
           </div>
         </div>
@@ -318,6 +355,32 @@ export default function AgentPanel({
             <Image className="w-3 h-3" />
             Image + Annotations
           </button>
+        </div>
+
+        {/* Thinking mode toggle */}
+        <div className="flex items-center gap-1 text-[10px] text-gray-500">
+          <Brain className="w-3 h-3" />
+          <span>Reasoning:</span>
+          {(['auto', 'on', 'off'] as const).map((mode) => (
+            <button
+              key={mode}
+              onClick={() => setThinkingMode(mode)}
+              title={
+                mode === 'auto'
+                  ? 'Enable reasoning for first generation, skip on refinements'
+                  : mode === 'on'
+                    ? 'Always enable reasoning (slower, more thorough)'
+                    : 'Disable reasoning (fastest inference)'
+              }
+              className={`px-1.5 py-0.5 rounded capitalize ${
+                thinkingMode === mode
+                  ? 'bg-purple-600/20 text-purple-400 ring-1 ring-purple-500/40'
+                  : 'text-gray-500 hover:text-gray-300 hover:bg-gray-800'
+              }`}
+            >
+              {mode}
+            </button>
+          ))}
         </div>
 
         {/* Action buttons */}

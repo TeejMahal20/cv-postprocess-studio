@@ -36,6 +36,75 @@ export async function invokeAgent(
   return data;
 }
 
+export interface StreamCallbacks {
+  onThinkingDelta?: (text: string) => void;
+  onTextDelta?: (text: string) => void;
+  onThinkingDone?: () => void;
+  onDone?: (response: AgentResponse) => void;
+  onError?: (error: Error) => void;
+}
+
+export async function invokeAgentStream(
+  request: AgentRequest,
+  callbacks: StreamCallbacks,
+): Promise<AgentResponse> {
+  const res = await fetch('/api/agent/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Stream request failed: ${res.status}`);
+  }
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalResponse: AgentResponse | null = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Parse SSE lines from the buffer
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+
+    let currentEvent = '';
+    for (const line of lines) {
+      if (line.startsWith('event: ')) {
+        currentEvent = line.slice(7);
+      } else if (line.startsWith('data: ')) {
+        const data = JSON.parse(line.slice(6));
+        switch (currentEvent) {
+          case 'thinking_delta':
+            callbacks.onThinkingDelta?.(data);
+            break;
+          case 'text_delta':
+            callbacks.onTextDelta?.(data);
+            break;
+          case 'thinking_done':
+            callbacks.onThinkingDone?.();
+            break;
+          case 'done':
+            finalResponse = JSON.parse(data) as AgentResponse;
+            callbacks.onDone?.(finalResponse);
+            break;
+        }
+      }
+    }
+  }
+
+  if (!finalResponse) {
+    throw new Error('Stream ended without a final response');
+  }
+  return finalResponse;
+}
+
 export async function executeCode(
   request: ExecuteRequest,
 ): Promise<ExecuteResponse> {

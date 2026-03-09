@@ -1,10 +1,19 @@
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs/promises';
 import path from 'path';
+import type { Response as ExpressResponse } from 'express';
 import type { AgentRequest, AgentResponse, HumanAnnotation, COCODataset, ConversationMessage } from '../../../shared/types.js';
 import { renderTemplate } from '../prompts/renderTemplate.js';
 import { getInputsDir } from './fileService.js';
 import { enrichAnnotationsWithContext } from './spatialEnrichment.js';
+
+function shouldEnableThinking(request: AgentRequest): boolean {
+  const mode = request.context.thinking_mode ?? 'auto';
+  if (mode === 'on') return true;
+  if (mode === 'off') return false;
+  // 'auto': enable on first generation (no previous code), skip on refinements
+  return !request.context.previous_code;
+}
 
 function formatHumanAnnotations(annotations?: HumanAnnotation[]): string {
   if (!annotations?.length) return '';
@@ -88,6 +97,25 @@ export async function invokeAgent(
   return invokeGenerateMode(request);
 }
 
+export async function invokeAgentStream(
+  request: AgentRequest,
+  res: ExpressResponse,
+): Promise<void> {
+  const mode = request.mode ?? 'generate';
+  console.log(`[Agent/Stream] mode=${mode}, prompt="${request.prompt.slice(0, 80)}..."`);
+
+  if (mode === 'chat') {
+    // Chat mode doesn't use thinking, fall back to non-streaming
+    const response = await invokeChatMode(request);
+    sendSSE(res, 'explanation', response.explanation);
+    sendSSE(res, 'done', JSON.stringify(response));
+    res.end();
+    return;
+  }
+
+  return invokeGenerateModeStream(request, res);
+}
+
 async function invokeGenerateMode(
   request: AgentRequest,
 ): Promise<AgentResponse> {
@@ -123,16 +151,23 @@ async function invokeGenerateMode(
     userContent = userMessageText;
   }
 
-  console.log(`[Agent/Generate] Calling Claude API...`);
+  const useThinking = shouldEnableThinking(request);
+  console.log(`[Agent/Generate] Calling Claude API... (thinking: ${useThinking})`);
   const response = await getClient().messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 16384,
     system: systemPrompt,
     messages: [{ role: 'user', content: userContent }],
-    thinking: { type: 'enabled', budget_tokens: 4096 },
+    ...(useThinking && { thinking: { type: 'enabled' as const, budget_tokens: 4096 } }),
     stop_sequences: ['</code>'],
   });
   console.log(`[Agent/Generate] Claude responded: ${response.usage?.input_tokens} input, ${response.usage?.output_tokens} output tokens`);
+
+  // Extract thinking blocks for transparency
+  const thinkingBlocks = response.content.filter((b) => b.type === 'thinking');
+  const thinking = thinkingBlocks
+    .map((b) => (b as Anthropic.ThinkingBlock).thinking)
+    .join('\n\n') || undefined;
 
   // Extract text content from response (skip thinking blocks)
   const textBlocks = response.content.filter((b) => b.type === 'text');
@@ -156,8 +191,98 @@ async function invokeGenerateMode(
   return {
     code,
     explanation,
+    thinking,
     agent_message_id: response.id,
   };
+}
+
+function sendSSE(res: ExpressResponse, event: string, data: string): void {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+async function invokeGenerateModeStream(
+  request: AgentRequest,
+  res: ExpressResponse,
+): Promise<void> {
+  const systemPrompt = await buildSystemPrompt(request);
+  const userMessageText = buildUserMessage(request);
+
+  let userContent: Anthropic.MessageCreateParams['messages'][0]['content'];
+  if (request.context.canvas_snapshot) {
+    userContent = [
+      {
+        type: 'image' as const,
+        source: {
+          type: 'base64' as const,
+          media_type: 'image/jpeg' as const,
+          data: request.context.canvas_snapshot,
+        },
+      },
+      {
+        type: 'text' as const,
+        text: 'The image above shows the canvas with COCO annotation overlays and user-drawn annotations (in orange). Use this to understand the spatial relationships between features and user annotations.\n\n' + userMessageText,
+      },
+    ];
+  } else {
+    userContent = userMessageText;
+  }
+
+  const useThinking = shouldEnableThinking(request);
+  console.log(`[Agent/Stream] Calling Claude streaming API... (thinking: ${useThinking})`);
+
+  const stream = getClient().messages.stream({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 16384,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userContent }],
+    ...(useThinking && { thinking: { type: 'enabled' as const, budget_tokens: 4096 } }),
+    stop_sequences: ['</code>'],
+  });
+
+  let fullThinking = '';
+  let fullText = '';
+
+  stream.on('thinking', (thinkingDelta: string) => {
+    fullThinking += thinkingDelta;
+    sendSSE(res, 'thinking_delta', thinkingDelta);
+  });
+
+  let thinkingDone = false;
+  stream.on('text', (textDelta: string) => {
+    if (!thinkingDone) {
+      thinkingDone = true;
+      sendSSE(res, 'thinking_done', '');
+    }
+    fullText += textDelta;
+    // Text is NOT streamed — only reasoning is streamed live.
+    // The full code + explanation are sent in the final 'done' event.
+  });
+
+  const finalMessage = await stream.finalMessage();
+  console.log(`[Agent/Stream] Claude responded: ${finalMessage.usage?.input_tokens} input, ${finalMessage.usage?.output_tokens} output tokens`);
+
+  // Parse the accumulated text into code + explanation
+  const xmlCodeMatch = fullText.match(/<code>\n?([\s\S]*?)(?:<\/code>|$)/);
+  const fenceMatch = fullText.match(/```python\n([\s\S]*?)```/);
+  const code = xmlCodeMatch ? xmlCodeMatch[1].trim() : fenceMatch ? fenceMatch[1] : fullText;
+
+  const xmlExplMatch = fullText.match(/<explanation>([\s\S]*?)<\/explanation>/);
+  const explanation = xmlExplMatch
+    ? xmlExplMatch[1].trim()
+    : fullText
+        .replace(/<code>[\s\S]*?(?:<\/code>|$)/, '')
+        .replace(/```python\n[\s\S]*?```/, '')
+        .trim() || 'Generated by Claude.';
+
+  const result: AgentResponse = {
+    code,
+    explanation,
+    thinking: fullThinking || undefined,
+    agent_message_id: finalMessage.id,
+  };
+
+  sendSSE(res, 'done', JSON.stringify(result));
+  res.end();
 }
 
 async function invokeChatMode(

@@ -36,12 +36,19 @@ export async function promoteRecipe(
   const systemPrompt = await buildPromotionSystemPrompt();
   const userMessage = buildPromotionUserMessage(recipe);
 
-  const response = await getClient().messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 8192,
-    system: systemPrompt,
-    messages: [{ role: 'user', content: userMessage }],
-  });
+  let response;
+  try {
+    response = await getClient().messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 8192,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userMessage }],
+    });
+  } catch (apiErr) {
+    const msg = apiErr instanceof Error ? apiErr.message : String(apiErr);
+    console.error('[Promotion] Anthropic API error:', msg);
+    throw Object.assign(new Error(`Claude API error: ${msg}`), { status: 502 });
+  }
 
   const textBlock = response.content.find((b) => b.type === 'text');
   const content = textBlock?.text || '';

@@ -43,6 +43,7 @@ export default function App() {
   // Canvas snapshot for vision input
   const canvasViewerRef = useRef<CanvasViewerHandle>(null);
   const [snapshotMode, setSnapshotMode] = useState<'annotations' | 'full'>('annotations');
+  const [thinkingMode, setThinkingMode] = useState<'auto' | 'on' | 'off'>('auto');
 
   const agent = useAgent();
   const execution = useExecution();
@@ -99,6 +100,7 @@ export default function App() {
           previousError: executionResult?.error || null,
           humanAnnotations,
           canvasSnapshot: snapshot,
+          thinkingMode,
         });
         if (response.code) setCode(response.code);
       } catch (err) {
@@ -106,7 +108,7 @@ export default function App() {
         agent.addSystemMessage(`Generation failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
       }
     },
-    [sessionId, uploadResult, calibration, code, executionResult, agent, humanAnnotations, snapshotMode],
+    [sessionId, uploadResult, calibration, code, executionResult, agent, humanAnnotations, snapshotMode, thinkingMode],
   );
 
   const handleGenerateAndRun = useCallback(
@@ -126,6 +128,7 @@ export default function App() {
           previousError: executionResult?.error || null,
           humanAnnotations,
           canvasSnapshot: snapshot,
+          thinkingMode,
         });
         if (response.code) {
           setCode(response.code);
@@ -141,7 +144,7 @@ export default function App() {
         agent.addSystemMessage(`Generate & Run failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
       }
     },
-    [sessionId, uploadResult, calibration, code, executionResult, agent, execution, handleExecutionResult, humanAnnotations, snapshotMode],
+    [sessionId, uploadResult, calibration, code, executionResult, agent, execution, handleExecutionResult, humanAnnotations, snapshotMode, thinkingMode],
   );
 
   const handleChat = useCallback(
@@ -160,13 +163,14 @@ export default function App() {
           previousError: executionResult?.error || null,
           humanAnnotations,
           canvasSnapshot: snapshot,
+          thinkingMode,
         });
       } catch (err) {
         console.error('[App] handleChat error:', err);
         agent.addSystemMessage(`Chat failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
       }
     },
-    [sessionId, uploadResult, calibration, code, executionResult, agent, humanAnnotations, snapshotMode],
+    [sessionId, uploadResult, calibration, code, executionResult, agent, humanAnnotations, snapshotMode, thinkingMode],
   );
 
   const handleRun = useCallback(async () => {
@@ -398,6 +402,8 @@ export default function App() {
       canvasRef={canvasViewerRef}
       snapshotMode={snapshotMode}
       setSnapshotMode={setSnapshotMode}
+      thinkingMode={thinkingMode}
+      setThinkingMode={setThinkingMode}
     />
     {promoteTarget && (
       <PromoteDialog

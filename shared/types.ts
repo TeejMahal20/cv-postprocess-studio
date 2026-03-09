@@ -93,12 +93,14 @@ export interface AgentRequest {
     previous_error: string | null;
     human_annotations?: HumanAnnotation[];
     canvas_snapshot?: string; // base64 JPEG of canvas (annotations-only or full)
+    thinking_mode?: 'auto' | 'on' | 'off'; // default 'auto'
   };
 }
 
 export interface AgentResponse {
   code: string | null;
   explanation: string;
+  thinking?: string;
   agent_message_id: string;
 }
 
