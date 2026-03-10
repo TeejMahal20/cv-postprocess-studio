@@ -1,6 +1,10 @@
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs/promises';
 import path from 'path';
+
+// Model used for all agent API calls
+// Other options: 'claude-sonnet-4-5-20250514', 'claude-haiku-4-5-20251001', 'claude-opus-4-5-20250527'
+const CLAUDE_MODEL: Anthropic.Messages.Model = 'claude-sonnet-4-6';
 import type { Response as ExpressResponse } from 'express';
 import type { AgentRequest, AgentResponse, HumanAnnotation, COCODataset, ConversationMessage } from '../../../shared/types.js';
 import { renderTemplate } from '../prompts/renderTemplate.js';
@@ -154,7 +158,7 @@ async function invokeGenerateMode(
   const useThinking = shouldEnableThinking(request);
   console.log(`[Agent/Generate] Calling Claude API... (thinking: ${useThinking})`);
   const response = await getClient().messages.create({
-    model: 'claude-sonnet-4-6',
+    model: CLAUDE_MODEL,
     max_tokens: 16384,
     system: systemPrompt,
     messages: [{ role: 'user', content: userContent }],
@@ -231,7 +235,7 @@ async function invokeGenerateModeStream(
   console.log(`[Agent/Stream] Calling Claude streaming API... (thinking: ${useThinking})`);
 
   const stream = getClient().messages.stream({
-    model: 'claude-sonnet-4-6',
+    model: CLAUDE_MODEL,
     max_tokens: 16384,
     system: systemPrompt,
     messages: [{ role: 'user', content: userContent }],
@@ -301,7 +305,7 @@ async function invokeChatMode(
 
   console.log(`[Agent/Chat] Calling Claude API...`);
   const response = await getClient().messages.create({
-    model: 'claude-sonnet-4-6',
+    model: CLAUDE_MODEL,
     max_tokens: 4096,
     system: systemPrompt,
     messages,
