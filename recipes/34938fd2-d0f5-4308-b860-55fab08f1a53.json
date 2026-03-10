@@ -1,0 +1,714 @@
+{
+  "id": "34938fd2-d0f5-4308-b860-55fab08f1a53",
+  "name": "Tab distance measurements",
+  "description": "To isolate only the **near-vertical inner edge segments**, the algorithm should:\n\n- Sample points along each Tab's contour and **filter to only those segments where the edge normal is predominantly horizontal** (i.e., the edge itself runs near-vertically, within some angular threshold like ±20° from vertical)\n- This excludes the top and bottom horizontal edges of each tab, keeping only the vertical facing sides that look across the gap toward the other tab\n\nThis will give a much tighter, more meaningful distribution of distances — the **min** will be the narrowest point of the gap, the **max** the widest, and the **mean** an average gap width along the vertical span of the tabs.\n\nWhen you're ready, click **Generate** and describe it as: *\"measure min, mean, and max distance between the near-vertical inner edges of the two Tab annotations only\"* so the code filters contour segments by orientation before computing distances.",
+  "code": "import cv2\nimport numpy as np\nimport json\nimport os\nimport math\nfrom itertools import combinations\n\n# --- CONFIGURATION ---\nTARGET_CATEGORY = \"Tab\"             # Category to analyze\nMIN_CONTOUR_AREA = 10               # Ignore contours smaller than this (pixels²)\nVERTICAL_ANGLE_THRESH_DEG = 60.0    # Max degrees from vertical for a segment to be\n                                    # considered \"near-vertical\" (excludes top/bottom edges)\nINNER_EDGE_HALF_ANGLE_DEG = 90.0    # Half-angle cone (degrees) around centroid axis\n                                    # that defines \"inner\" edge — 90° = entire facing hemisphere\nSAMPLE_SPACING_PX = 2               # Distance (px) between densely sampled points on edges\nCONTOUR_COLOR = \"#00FFFF\"           # Color for tab contour overlays\nINNER_EDGE_COLOR = \"#FF8800\"        # Color for near-vertical inner-edge highlights\nDIST_LINE_COLOR = \"#FF4444\"         # Color for min/max distance measurement lines\nMEAN_LINE_COLOR = \"#FFFF00\"         # Color for mean distance measurement line\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n\ndef compute_centroid(contour):\n    \"\"\"Compute the [x, y] centroid of a contour using image moments.\"\"\"\n    M = cv2.moments(contour)\n    if M[\"m00\"] == 0:\n        pts = contour.reshape(-1, 2)\n        return [float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1]))]\n    return [float(M[\"m10\"] / M[\"m00\"]), float(M[\"m01\"] / M[\"m00\"])]\n\n\ndef is_segment_near_vertical(a, b, angle_thresh_deg):\n    \"\"\"\n    Return True if segment a→b runs within angle_thresh_deg of vertical.\n    A perfectly vertical segment has direction (0, ±1); angle from vertical = 0°.\n    A perfectly horizontal segment has angle from vertical = 90°.\n    \"\"\"\n    dx = float(b[0] - a[0])\n    dy = float(b[1] - a[1])\n    seg_len = math.sqrt(dx * dx + dy * dy)\n    if seg_len < 1e-6:\n        return False\n    # cos(angle from vertical) = |dy| / seg_len\n    cos_from_vertical = abs(dy) / seg_len\n    angle_from_vertical_deg = math.degrees(math.acos(min(1.0, cos_from_vertical)))\n    return angle_from_vertical_deg <= angle_thresh_deg\n\n\ndef densify_near_vertical_segments(contour, spacing_px, angle_thresh_deg):\n    \"\"\"\n    Sample points densely only along near-vertical edge segments of a contour.\n    Segments outside the vertical angle threshold are skipped entirely.\n\n    Parameters\n    ----------\n    contour          : (N,1,2) int32 contour\n    spacing_px       : sampling interval in pixels\n    angle_thresh_deg : max degrees from vertical to accept a segment\n\n    Returns\n    -------\n    (M, 2) float64 array of sampled points, or empty (0,2) array if none qualify.\n    \"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    n = len(pts)\n    sampled = []\n    for i in range(n):\n        a = pts[i]\n        b = pts[(i + 1) % n]\n        if not is_segment_near_vertical(a, b, angle_thresh_deg):\n            continue\n        seg_len = float(np.linalg.norm(b - a))\n        if seg_len < 1e-6:\n            sampled.append(a.tolist())\n            continue\n        num_steps = max(1, int(math.ceil(seg_len / spacing_px)))\n        for t_idx in range(num_steps):\n            t = t_idx / num_steps\n            sampled.append((a + t * (b - a)).tolist())\n    if not sampled:\n        return np.zeros((0, 2), dtype=np.float64)\n    return np.array(sampled, dtype=np.float64)\n\n\ndef filter_inner_facing_points(pts, own_centroid, other_centroid, half_angle_deg):\n    \"\"\"\n    From a set of 2-D points, keep only those whose direction from own_centroid\n    falls within half_angle_deg of the axis pointing toward other_centroid.\n\n    Parameters\n    ----------\n    pts            : (N, 2) float64 array\n    own_centroid   : [cx, cy]\n    other_centroid : [cx, cy] — defines the \"inner\" direction\n    half_angle_deg : acceptance half-cone angle in degrees\n\n    Returns\n    -------\n    (M, 2) float64 array of retained points.\n    \"\"\"\n    if len(pts) == 0:\n        return pts\n    cx, cy = float(own_centroid[0]), float(own_centroid[1])\n    ox, oy = float(other_centroid[0]), float(other_centroid[1])\n    axis = np.array([ox - cx, oy - cy], dtype=np.float64)\n    axis_len = float(np.linalg.norm(axis))\n    if axis_len < 1e-6:\n        return pts  # degenerate — keep all\n    axis_unit = axis / axis_len\n    cos_thresh = math.cos(math.radians(half_angle_deg))\n\n    vecs = pts - np.array([cx, cy], dtype=np.float64)\n    norms = np.linalg.norm(vecs, axis=1, keepdims=True)\n    valid_mask = norms[:, 0] > 1e-6\n    cos_angles = np.where(\n        valid_mask,\n        (vecs / np.where(valid_mask[:, np.newaxis], norms, 1.0)) @ axis_unit,\n        -1.0,\n    )\n    inner_mask = cos_angles >= cos_thresh\n    return pts[inner_mask]\n\n\ndef extract_near_vertical_inner_edge_points(contour, own_centroid, other_centroid,\n                                             vertical_angle_thresh_deg,\n                                             inner_half_angle_deg,\n                                             spacing_px):\n    \"\"\"\n    Extract points from a contour that satisfy BOTH criteria:\n      1. Lie on a near-vertical edge segment (orientation filter)\n      2. Face toward the other contour (inner-hemisphere filter)\n\n    Falls back to all near-vertical points if the combined filter yields nothing.\n\n    Returns\n    -------\n    (M, 2) float64 array\n    \"\"\"\n    # Step 1: sample points only from near-vertical segments\n    vert_pts = densify_near_vertical_segments(contour, spacing_px, vertical_angle_thresh_deg)\n\n    if len(vert_pts) == 0:\n        return vert_pts  # no near-vertical segments found\n\n    # Step 2: keep only inner-facing points\n    inner_pts = filter_inner_facing_points(\n        vert_pts, own_centroid, other_centroid, inner_half_angle_deg)\n\n    if len(inner_pts) == 0:\n        # Fallback: return all near-vertical points regardless of hemisphere\n        return vert_pts\n\n    return inner_pts\n\n\ndef closest_point_on_segment(p, a, b):\n    \"\"\"Project point p onto segment a–b; return the closest point on the segment.\"\"\"\n    ab = b - a\n    denom = float(np.dot(ab, ab))\n    if denom < 1e-10:\n        return a.copy()\n    t = float(np.dot(p - a, ab) / denom)\n    t = max(0.0, min(1.0, t))\n    return a + t * ab\n\n\ndef point_to_pointset_min_distance(pt, target_pts):\n    \"\"\"\n    Compute the minimum distance from a single point to a polyline defined by\n    target_pts, using edge-segment projection for sub-pixel accuracy.\n\n    Returns (min_distance, nearest_point_on_target).\n    \"\"\"\n    min_dist = float(\"inf\")\n    nearest = target_pts[0].copy()\n    n = len(target_pts)\n    for j in range(n - 1):\n        proj = closest_point_on_segment(pt, target_pts[j], target_pts[j + 1])\n        d = float(np.linalg.norm(pt - proj))\n        if d < min_dist:\n            min_dist = d\n            nearest = proj.copy()\n    # Wrap-around closure\n    proj = closest_point_on_segment(pt, target_pts[-1], target_pts[0])\n    d = float(np.linalg.norm(pt - proj))\n    if d < min_dist:\n        min_dist = d\n        nearest = proj.copy()\n    return min_dist, nearest\n\n\ndef measure_edge_distances(inner_pts_a, inner_pts_b):\n    \"\"\"\n    For every point on edge A, find the closest point on edge B.\n    Returns a dict with min, mean, max distances and the paired points\n    used for visualizing each landmark distance.\n    \"\"\"\n    distances = []\n    nearest_on_b = []\n\n    for pt in inner_pts_a:\n        d, nb = point_to_pointset_min_distance(pt, inner_pts_b)\n        distances.append(d)\n        nearest_on_b.append(nb)\n\n    distances = np.array(distances, dtype=np.float64)\n    idx_min = int(np.argmin(distances))\n    idx_max = int(np.argmax(distances))\n    mean_val = float(np.mean(distances))\n    idx_mean = int(np.argmin(np.abs(distances - mean_val)))\n\n    return {\n        \"min_dist_px\":    round(float(distances[idx_min]), 2),\n        \"mean_dist_px\":   round(mean_val, 2),\n        \"max_dist_px\":    round(float(distances[idx_max]), 2),\n        \"min_pt_a\":  [float(inner_pts_a[idx_min][0]),  float(inner_pts_a[idx_min][1])],\n        \"min_pt_b\":  [float(nearest_on_b[idx_min][0]), float(nearest_on_b[idx_min][1])],\n        \"max_pt_a\":  [float(inner_pts_a[idx_max][0]),  float(inner_pts_a[idx_max][1])],\n        \"max_pt_b\":  [float(nearest_on_b[idx_max][0]), float(nearest_on_b[idx_max][1])],\n        \"mean_pt_a\": [float(inner_pts_a[idx_mean][0]), float(inner_pts_a[idx_mean][1])],\n        \"mean_pt_b\": [float(nearest_on_b[idx_mean][0]),float(nearest_on_b[idx_mean][1])],\n        \"sample_count\": int(len(distances)),\n    }\n\n\n# --- PIPELINE ---\n\ndef find_image_file():\n    \"\"\"Find the image file in INPUT_DIR (there is always exactly one).\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\n\ndef contour_from_annotation(ann):\n    \"\"\"Extract an int32 contour from a polygon segmentation annotation.\"\"\"\n    if not isinstance(ann[\"segmentation\"], list) or len(ann[\"segmentation\"]) == 0:\n        return None\n    seg = ann[\"segmentation\"][0]\n    return np.array(seg, dtype=np.float64).reshape(-1, 1, 2).astype(np.int32)\n\n\ndef build_overlays(ann_a, ann_b, contour_a, contour_b,\n                   inner_pts_a, inner_pts_b, dist_result):\n    \"\"\"Build visual overlays: tab contours, near-vertical inner edges, distance lines.\"\"\"\n    overlays = []\n\n    # 1. Full tab contour outlines\n    for ann, cnt in [(ann_a, contour_a), (ann_b, contour_b)]:\n        pts = [[int(p[0][0]), int(p[0][1])] for p in cnt.tolist()]\n        overlays.append({\n            \"type\": \"contours\",\n            \"points\": pts,\n            \"color\": CONTOUR_COLOR,\n            \"label\": f\"Tab {ann['id']}\",\n        })\n\n    # 2. Near-vertical inner edge polylines\n    for inner_pts, label in [\n        (inner_pts_a, f\"Vert. inner edge Tab {ann_a['id']}\"),\n        (inner_pts_b, f\"Vert. inner edge Tab {ann_b['id']}\"),\n    ]:\n        # Subsample for overlay clarity (at most ~300 points)\n        step = max(1, len(inner_pts) // 300)\n        pts_overlay = [[float(p[0]), float(p[1])] for p in inner_pts[::step]]\n        overlays.append({\n            \"type\": \"polyline\",\n            \"points\": pts_overlay,\n            \"color\": INNER_EDGE_COLOR,\n            \"width\": 3,\n            \"dashed\": False,\n            \"label\": label,\n        })\n\n    # 3. Min / mean / max gap measurement lines\n    lines = []\n    for pt_a, pt_b, val, color, tag in [\n        (dist_result[\"min_pt_a\"],  dist_result[\"min_pt_b\"],  dist_result[\"min_dist_px\"],  DIST_LINE_COLOR, \"Min\"),\n        (dist_result[\"mean_pt_a\"], dist_result[\"mean_pt_b\"], dist_result[\"mean_dist_px\"], MEAN_LINE_COLOR, \"Mean\"),\n        (dist_result[\"max_pt_a\"],  dist_result[\"max_pt_b\"],  dist_result[\"max_dist_px\"],  DIST_LINE_COLOR, \"Max\"),\n    ]:\n        lines.append({\n            \"start\": [float(pt_a[0]), float(pt_a[1])],\n            \"end\":   [float(pt_b[0]), float(pt_b[1])],\n            \"value\": f\"{tag}: {val:.1f} px\",\n            \"color\": color,\n        })\n    overlays.append({\"type\": \"measurements\", \"lines\": lines})\n\n    return overlays\n\n\ndef write_result(overlays, metrics, ctq_results, stdout_msg=\"\"):\n    result = {\n        \"overlays\":    overlays,\n        \"metrics\":     metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\":      stdout_msg,\n    }\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        msg = \"ERROR: Failed to load image.\"\n        print(msg)\n        write_result([], {\"error\": \"Image load failed\"}, [], msg)\n        return\n\n    # Filter to target category\n    tab_anns = [a for a in coco[\"annotations\"]\n                if cat_map.get(a[\"category_id\"], \"\") == TARGET_CATEGORY]\n\n    if len(tab_anns) < 2:\n        msg = (f\"Found {len(tab_anns)} '{TARGET_CATEGORY}' annotation(s); need at least 2.\")\n        print(f\"WARNING: {msg}\")\n        write_result([], {\"error\": msg}, [], msg)\n        return\n\n    # Build valid contours\n    contour_map = {}\n    valid_anns = []\n    for ann in tab_anns:\n        cnt = contour_from_annotation(ann)\n        if cnt is None:\n            continue\n        if float(cv2.contourArea(cnt)) < MIN_CONTOUR_AREA:\n            continue\n        contour_map[ann[\"id\"]] = cnt\n        valid_anns.append(ann)\n\n    if len(valid_anns) < 2:\n        msg = f\"Fewer than 2 valid '{TARGET_CATEGORY}' contours after area filtering.\"\n        print(f\"WARNING: {msg}\")\n        write_result([], {\"error\": msg}, [], msg)\n        return\n\n    ctq_results = []\n    all_overlays = []\n    pair_idx = 0\n\n    for (ann_a, ann_b) in combinations(valid_anns, 2):\n        pair_idx += 1\n        cnt_a = contour_map[ann_a[\"id\"]]\n        cnt_b = contour_map[ann_b[\"id\"]]\n\n        centroid_a = compute_centroid(cnt_a)\n        centroid_b = compute_centroid(cnt_b)\n\n        # Extract near-vertical + inner-facing edge points for each tab\n        inner_pts_a = extract_near_vertical_inner_edge_points(\n            cnt_a, centroid_a, centroid_b,\n            VERTICAL_ANGLE_THRESH_DEG, INNER_EDGE_HALF_ANGLE_DEG, SAMPLE_SPACING_PX)\n\n        inner_pts_b = extract_near_vertical_inner_edge_points(\n            cnt_b, centroid_b, centroid_a,\n            VERTICAL_ANGLE_THRESH_DEG, INNER_EDGE_HALF_ANGLE_DEG, SAMPLE_SPACING_PX)\n\n        if len(inner_pts_a) == 0 or len(inner_pts_b) == 0:\n            msg = (f\"WARNING: No near-vertical inner-edge points found for pair \"\n                   f\"(Tab {ann_a['id']}, Tab {ann_b['id']}). \"\n                   f\"Try increasing VERTICAL_ANGLE_THRESH_DEG (currently {VERTICAL_ANGLE_THRESH_DEG}°).\")\n            print(msg)\n            continue\n\n        dist_result = measure_edge_distances(inner_pts_a, inner_pts_b)\n\n        ctq_results.append({\n            \"feature_id\": pair_idx,\n            \"label\": f\"tab_vert_inner_pair_{pair_idx:03d}\",\n            \"category\": TARGET_CATEGORY,\n            \"ann_id_a\": int(ann_a[\"id\"]),\n            \"ann_id_b\": int(ann_b[\"id\"]),\n            \"measurements\": {\n                \"min_inner_edge_dist_px\":  dist_result[\"min_dist_px\"],\n                \"mean_inner_edge_dist_px\": dist_result[\"mean_dist_px\"],\n                \"max_inner_edge_dist_px\":  dist_result[\"max_dist_px\"],\n                \"sample_count\":            dist_result[\"sample_count\"],\n            },\n        })\n\n        pair_overlays = build_overlays(\n            ann_a, ann_b, cnt_a, cnt_b, inner_pts_a, inner_pts_b, dist_result)\n        all_overlays.extend(pair_overlays)\n\n    if not ctq_results:\n        msg = \"No valid tab pairs could be measured with the current vertical angle threshold.\"\n        print(f\"WARNING: {msg}\")\n        write_result([], {\"error\": msg}, [], msg)\n        return\n\n    all_mins  = [r[\"measurements\"][\"min_inner_edge_dist_px\"]  for r in ctq_results]\n    all_means = [r[\"measurements\"][\"mean_inner_edge_dist_px\"] for r in ctq_results]\n    all_maxs  = [r[\"measurements\"][\"max_inner_edge_dist_px\"]  for r in ctq_results]\n\n    metrics = {\n        \"tab_count\":                     int(len(valid_anns)),\n        \"pair_count\":                    int(len(ctq_results)),\n        \"overall_min_inner_dist_px\":     round(float(min(all_mins)),  2),\n        \"overall_mean_inner_dist_px\":    round(float(sum(all_means) / len(all_means)), 2),\n        \"overall_max_inner_dist_px\":     round(float(max(all_maxs)),  2),\n        \"vertical_angle_thresh_deg\":     float(VERTICAL_ANGLE_THRESH_DEG),\n        \"inner_edge_half_angle_deg\":     float(INNER_EDGE_HALF_ANGLE_DEG),\n        \"sample_spacing_px\":             float(SAMPLE_SPACING_PX),\n    }\n\n    write_result(all_overlays, metrics, ctq_results)\n\n    print(\n        f\"Processed {len(valid_anns)} '{TARGET_CATEGORY}' tabs → {len(ctq_results)} pair(s) \"\n        f\"using near-vertical segments (±{VERTICAL_ANGLE_THRESH_DEG}° from vertical). \"\n        f\"Gap distances — \"\n        f\"min: {metrics['overall_min_inner_dist_px']:.1f} px, \"\n        f\"mean: {metrics['overall_mean_inner_dist_px']:.1f} px, \"\n        f\"max: {metrics['overall_max_inner_dist_px']:.1f} px.\"\n    )\n\n\nmain()",
+  "prompt": "To isolate only the **near-vertical inner edge segments**, the algorithm should:\n\n- Sample points along each Tab's contour and **filter to only those segments where the edge normal is predominantly horizontal** (i.e., the edge itself runs near-vertically, within some angular threshold like ±20° from vertical)\n- This excludes the top and bottom horizontal edges of each tab, keeping only the vertical facing sides that look across the gap toward the other tab\n\nThis will give a much tighter, more meaningful distribution of distances — the **min** will be the narrowest point of the gap, the **max** the widest, and the **mean** an average gap width along the vertical span of the tabs.\n\nWhen you're ready, click **Generate** and describe it as: *\"measure min, mean, and max distance between the near-vertical inner edges of the two Tab annotations only\"* so the code filters contour segments by orientation before computing distances.",
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "measure the minimum, maximum, mean, and centroid distance between tabs",
+      "timestamp": 1773000191311
+    },
+    {
+      "role": "assistant",
+      "content": "Targeting all \"Tab\" category annotations and computing pairwise distances between every tab pair. For minimum distance, I use `cv2.pointPolygonTest` with edge-projection to find the true closest point pair on the contour boundaries (not just vertices). Centroid distance is computed from contour moments. Min, max, and mean are summarized across all tab pairs.",
+      "thinking": "The user wants to measure distances between \"Tab\" annotations. Let me analyze what's needed:\n\n1. Find all \"Tab\" category annotations\n2. For each pair of tabs, measure the minimum distance between contours\n3. Also compute centroid distances\n4. Calculate min, max, mean of both minimum contour distances and centroid distances\n\nSince there are Tab annotations (plural), I need to measure pairwise distances between them. Let me think about the structure:\n\n- Find all Tab annotations\n- Extract contours\n- For each pair of tabs, compute:\n  - Minimum contour-to-contour distance (using pointPolygonTest)\n  - Centroid-to-centroid distance\n\n\n- Report min, max, mean statistics for both distance types\n\nFor the visualization, I'll draw the tab contours and overlay measurement lines showing both the closest points between contour pairs and lines connecting centroids. I'll use cv2.moments to extract each contour's centroid, then compute all pairwise distances across the N tabs.\n\nWriting the code...",
+      "timestamp": 1773000191311,
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\nimport math\nfrom itertools import combinations\n\n# --- CONFIGURATION ---\nTARGET_CATEGORY = \"Tab\"          # Category name to measure distances between\nMIN_CONTOUR_AREA = 10            # Ignore contours smaller than this (pixels²)\nCONTOUR_COLOR = \"#00FFFF\"        # Overlay color for tab contours\nMIN_DIST_COLOR = \"#FF4444\"       # Color for minimum-distance measurement lines\nCENTROID_DIST_COLOR = \"#FFFF00\"  # Color for centroid-to-centroid measurement lines\nCENTROID_DOT_RADIUS = 6          # Visual radius of centroid markers (pixels)\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n# Generic functions — no hardcoded category names. Accept contours/data as parameters.\n\ndef compute_centroid(contour):\n    \"\"\"Compute the centroid [x, y] of a contour using image moments.\"\"\"\n    M = cv2.moments(contour)\n    if M[\"m00\"] == 0:\n        pts = contour.reshape(-1, 2)\n        cx = float(np.mean(pts[:, 0]))\n        cy = float(np.mean(pts[:, 1]))\n    else:\n        cx = float(M[\"m10\"] / M[\"m00\"])\n        cy = float(M[\"m01\"] / M[\"m00\"])\n    return [cx, cy]\n\ndef closest_point_on_segment(p, a, b):\n    \"\"\"Project point p onto line segment a–b; return the closest point on the segment.\"\"\"\n    ab = b - a\n    denom = np.dot(ab, ab)\n    if denom < 1e-10:\n        return a.copy()\n    t = float(np.dot(p - a, ab) / denom)\n    t = max(0.0, min(1.0, t))\n    return a + t * ab\n\ndef find_closest_contour_points(contour_a, contour_b):\n    \"\"\"\n    Find the closest point pair between two contours using edge-projection.\n    Returns (pt_on_a, pt_on_b, min_distance_px).\n    Uses pointPolygonTest for speed, then refines with segment projection.\n    \"\"\"\n    pts_a = contour_a.reshape(-1, 2).astype(np.float64)\n    pts_b = contour_b.reshape(-1, 2).astype(np.float64)\n    min_dist = float(\"inf\")\n    best_a = pts_a[0]\n    best_b = pts_b[0]\n\n    # Check each vertex of A against each edge of B\n    n_b = len(pts_b)\n    for pt in pts_a:\n        for j in range(n_b):\n            seg_s = pts_b[j]\n            seg_e = pts_b[(j + 1) % n_b]\n            proj = closest_point_on_segment(pt, seg_s, seg_e)\n            d = float(np.linalg.norm(pt - proj))\n            if d < min_dist:\n                min_dist = d\n                best_a = pt.copy()\n                best_b = proj.copy()\n\n    # Check each vertex of B against each edge of A\n    n_a = len(pts_a)\n    for pt in pts_b:\n        for i in range(n_a):\n            seg_s = pts_a[i]\n            seg_e = pts_a[(i + 1) % n_a]\n            proj = closest_point_on_segment(pt, seg_s, seg_e)\n            d = float(np.linalg.norm(pt - proj))\n            if d < min_dist:\n                min_dist = d\n                best_a = proj.copy()\n                best_b = pt.copy()\n\n    return best_a, best_b, min_dist\n\ndef measure_pairwise_distances(contours_with_ids):\n    \"\"\"\n    Compute pairwise minimum contour distance and centroid distance\n    for all combinations of contours.\n    Returns a list of dicts with pair info and measurements.\n    \"\"\"\n    results = []\n    centroids = {idx: compute_centroid(c) for idx, c in contours_with_ids}\n\n    pairs = list(combinations(contours_with_ids, 2))\n    for (idx_a, cnt_a), (idx_b, cnt_b) in pairs:\n        pt_a, pt_b, min_dist_px = find_closest_contour_points(cnt_a, cnt_b)\n\n        cx_a, cy_a = centroids[idx_a]\n        cx_b, cy_b = centroids[idx_b]\n        centroid_dist_px = float(math.sqrt((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2))\n\n        results.append({\n            \"id_a\": idx_a,\n            \"id_b\": idx_b,\n            \"min_dist_px\": round(min_dist_px, 2),\n            \"centroid_dist_px\": round(centroid_dist_px, 2),\n            \"closest_pt_a\": [float(pt_a[0]), float(pt_a[1])],\n            \"closest_pt_b\": [float(pt_b[0]), float(pt_b[1])],\n            \"centroid_a\": [float(cx_a), float(cy_a)],\n            \"centroid_b\": [float(cx_b), float(cy_b)],\n        })\n    return results\n\ndef summarize_distances(pair_results):\n    \"\"\"Compute min, max, mean for minimum and centroid distances across all pairs.\"\"\"\n    if not pair_results:\n        return {}\n    min_dists = [r[\"min_dist_px\"] for r in pair_results]\n    cent_dists = [r[\"centroid_dist_px\"] for r in pair_results]\n    return {\n        \"min_contour_dist_px\": round(float(min(min_dists)), 2),\n        \"max_contour_dist_px\": round(float(max(min_dists)), 2),\n        \"mean_contour_dist_px\": round(float(sum(min_dists) / len(min_dists)), 2),\n        \"min_centroid_dist_px\": round(float(min(cent_dists)), 2),\n        \"max_centroid_dist_px\": round(float(max(cent_dists)), 2),\n        \"mean_centroid_dist_px\": round(float(sum(cent_dists) / len(cent_dists)), 2),\n        \"num_pairs\": int(len(pair_results)),\n    }\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef find_image_file():\n    \"\"\"Find the image file in INPUT_DIR (there is always exactly one).\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef contour_from_annotation(ann):\n    \"\"\"Extract a contour from a polygon segmentation annotation.\"\"\"\n    if not isinstance(ann[\"segmentation\"], list) or len(ann[\"segmentation\"]) == 0:\n        return None\n    seg = ann[\"segmentation\"][0]\n    contour = np.array(seg, dtype=np.float64).reshape(-1, 1, 2)\n    contour = contour.astype(np.int32)\n    return contour\n\ndef build_overlays(tab_anns, cat_map, pair_results, contour_map):\n    \"\"\"Build visual overlays: tab contours, min-distance lines, centroid lines.\"\"\"\n    overlays = []\n\n    # 1. Tab contours\n    for ann in tab_anns:\n        cnt = contour_map.get(ann[\"id\"])\n        if cnt is None:\n            continue\n        pts = cnt.reshape(-1, 2).tolist()\n        pts_float = [[float(p[0]), float(p[1])] for p in pts]\n        overlays.append({\n            \"type\": \"contours\",\n            \"points\": pts_float,\n            \"color\": CONTOUR_COLOR,\n            \"label\": f\"Tab {ann['id']}\",\n        })\n\n    # 2. Minimum-distance lines between each pair\n    min_dist_lines = []\n    for r in pair_results:\n        min_dist_lines.append({\n            \"start\": [float(r[\"closest_pt_a\"][0]), float(r[\"closest_pt_a\"][1])],\n            \"end\":   [float(r[\"closest_pt_b\"][0]), float(r[\"closest_pt_b\"][1])],\n            \"value\": f\"{r['min_dist_px']:.1f} px\",\n            \"color\": MIN_DIST_COLOR,\n        })\n    if min_dist_lines:\n        overlays.append({\"type\": \"measurements\", \"lines\": min_dist_lines})\n\n    # 3. Centroid-to-centroid lines\n    centroid_lines = []\n    for r in pair_results:\n        centroid_lines.append({\n            \"start\": [float(r[\"centroid_a\"][0]), float(r[\"centroid_a\"][1])],\n            \"end\":   [float(r[\"centroid_b\"][0]), float(r[\"centroid_b\"][1])],\n            \"value\": f\"{r['centroid_dist_px']:.1f} px\",\n            \"color\": CENTROID_DIST_COLOR,\n        })\n    if centroid_lines:\n        overlays.append({\"type\": \"measurements\", \"lines\": centroid_lines})\n\n    # 4. Centroid dot markers (text overlay positioned at each centroid)\n    centroid_seen = {}\n    for r in pair_results:\n        for key, cx, cy in [(\"a\", r[\"centroid_a\"][0], r[\"centroid_a\"][1]),\n                            (\"b\", r[\"centroid_b\"][0], r[\"centroid_b\"][1])]:\n            id_key = r[f\"id_{key}\"]\n            if id_key not in centroid_seen:\n                centroid_seen[id_key] = (float(cx), float(cy))\n\n    text_entries = []\n    for ann_id, (cx, cy) in centroid_seen.items():\n        text_entries.append({\n            \"x\": float(cx) + 8,\n            \"y\": float(cy) - 8,\n            \"text\": f\"⊕ Tab {ann_id}\",\n            \"color\": CENTROID_DIST_COLOR,\n            \"size\": 13,\n        })\n    if text_entries:\n        overlays.append({\"type\": \"text\", \"entries\": text_entries})\n\n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        print(\"ERROR: Failed to load image.\")\n        result = {\n            \"overlays\": [], \"metrics\": {\"error\": \"Image load failed\"},\n            \"ctq_results\": [], \"stdout\": \"\",\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Filter to target category annotations\n    tab_anns = [\n        a for a in coco[\"annotations\"]\n        if cat_map.get(a[\"category_id\"], \"\") == TARGET_CATEGORY\n    ]\n\n    if len(tab_anns) < 2:\n        msg = (f\"Found {len(tab_anns)} '{TARGET_CATEGORY}' annotation(s); \"\n               f\"need at least 2 to measure distances.\")\n        print(f\"WARNING: {msg}\")\n        result = {\n            \"overlays\": [], \"metrics\": {\"error\": msg},\n            \"ctq_results\": [], \"stdout\": msg,\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Build contours, skip invalid/tiny ones\n    contour_map = {}\n    valid_tab_anns = []\n    for ann in tab_anns:\n        cnt = contour_from_annotation(ann)\n        if cnt is None:\n            continue\n        area = float(cv2.contourArea(cnt))\n        if area < MIN_CONTOUR_AREA:\n            continue\n        contour_map[ann[\"id\"]] = cnt\n        valid_tab_anns.append(ann)\n\n    if len(valid_tab_anns) < 2:\n        msg = (f\"Fewer than 2 valid '{TARGET_CATEGORY}' contours after filtering \"\n               f\"(min area {MIN_CONTOUR_AREA} px²).\")\n        print(f\"WARNING: {msg}\")\n        result = {\n            \"overlays\": [], \"metrics\": {\"error\": msg},\n            \"ctq_results\": [], \"stdout\": msg,\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Measure pairwise distances\n    contours_with_ids = [(ann[\"id\"], contour_map[ann[\"id\"]]) for ann in valid_tab_anns]\n    pair_results = measure_pairwise_distances(contours_with_ids)\n    summary = summarize_distances(pair_results)\n\n    # Build ctq_results — one entry per pair\n    ctq_results = []\n    label_map = {ann[\"id\"]: cat_map[ann[\"category_id\"]] for ann in valid_tab_anns}\n    for i, r in enumerate(pair_results, start=1):\n        ctq_results.append({\n            \"feature_id\": i,\n            \"label\": f\"tab_pair_{i:03d}\",\n            \"category\": TARGET_CATEGORY,\n            \"ann_id_a\": int(r[\"id_a\"]),\n            \"ann_id_b\": int(r[\"id_b\"]),\n            \"measurements\": {\n                \"min_contour_dist_px\": float(r[\"min_dist_px\"]),\n                \"centroid_dist_px\": float(r[\"centroid_dist_px\"]),\n            },\n        })\n\n    # Build metrics\n    metrics = {\n        \"tab_count\": int(len(valid_tab_anns)),\n        **{k: float(v) if isinstance(v, float) else int(v) for k, v in summary.items()},\n    }\n\n    overlays = build_overlays(valid_tab_anns, cat_map, pair_results, contour_map)\n\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\",\n    }\n\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n\n    print(\n        f\"Processed {len(valid_tab_anns)} '{TARGET_CATEGORY}' tabs → \"\n        f\"{len(pair_results)} pair(s). \"\n        f\"Contour dist — min: {summary['min_contour_dist_px']:.1f} px, \"\n        f\"max: {summary['max_contour_dist_px']:.1f} px, \"\n        f\"mean: {summary['mean_contour_dist_px']:.1f} px. \"\n        f\"Centroid dist — min: {summary['min_centroid_dist_px']:.1f} px, \"\n        f\"max: {summary['max_centroid_dist_px']:.1f} px, \"\n        f\"mean: {summary['mean_centroid_dist_px']:.1f} px.\"\n    )\n\nmain()"
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 1 features measured.",
+      "timestamp": 1773000243038
+    },
+    {
+      "role": "user",
+      "content": "Where is the maximum distance?",
+      "timestamp": 1773000288461
+    },
+    {
+      "role": "assistant",
+      "content": "Based on your results, there is only **1 pair** of Tab annotations in the dataset (2 tabs total), so the minimum, maximum, and mean distances are all the same value — there's only one measurement to report:\n\n- **Min contour distance: 126.0 px** — the closest point between the two tab edges\n- **Max contour distance: 126.0 px** — same pair, so identical\n- **Centroid distance: 229.2 px** — center-to-center separation between the two tabs\n\nSince you only have **2 Tab annotations**, there's only ever 1 possible pair, so min = max = mean by definition. If you want to see *where* that gap sits spatially, the maximum distance between the two tab **centroids** (229.2 px) represents the full center-to-center span. The contour distance of 126.0 px is the gap between their nearest edges.\n\nIf you'd like to explore the **spatial location** of this gap, you could measure the distance between the furthest points on each tab's contour (Feret diameter approach), or check if a **Seal or Defect** annotation falls within that inter-tab region. Would you like to pursue either of those?",
+      "timestamp": 1773000288461
+    },
+    {
+      "role": "user",
+      "content": "I was looking for the min, mean, and max distance between these tabs based on the inner tab edges",
+      "timestamp": 1773000333069
+    },
+    {
+      "role": "assistant",
+      "content": "Targeting the two \"Tab\" annotations and isolating only their inner-facing edges — the contour segments whose outward-facing direction points toward the other tab. For each inner edge, points are densely sampled along each segment; then every sampled point on one inner edge is matched to the nearest point on the other inner edge (via edge-projection) to produce a full distribution of across-gap distances, from which min, mean, and max are reported.",
+      "thinking": "The user wants to measure distances between the inner edges of the Tab annotations. The key insight here is that they want to measure distances specifically along the \"inner\" edges of the tabs, not the overall minimum distance between any two points on the contours.\n\nFor a battery tab, the \"inner edge\" likely refers to the edges facing each other (the edges between the two tabs). I need to figure out which edges of each tab contour are \"inner\" edges (facing toward the other tab) vs outer edges.\n\nThe approach would be:\n1. Find the two tab contours\n2. Determine the \"inner\" facing edges - these are the edges of each contour that face toward the other contour\n\n\n3. Measure distances between points on those inner edges\n\nTo identify which edges are \"inner,\" I can use the line connecting the two centroids as a reference. For each contour, the inner edges are those whose vertices lie on the side facing the other centroid, which gives me a straightforward way to classify and isolate the relevant edges for distance measurement. each vertex as \"inner\" if its projection onto the centroid-to-centroid axis is on the side facing the other centroid. Actually, let me think more carefully. The \"inner tab edges\" in the context of a battery would be the edges of the tabs that face each other - i.e., the edges between the two tabs.\n\nSo my approach is: compute the centroids of both tabs, then for each contour, identify which vertices are on the inner side by projecting them onto the direction vector between the two centroids. The inner edges are those vertices with the highest projection values along this direction, meaning they're closest to the other tab. I could either take the top N% of vertices or use a more robust threshold based on the edge geometry itself.\n\nActually, a cleaner approach is to check each edge's outward normal - if it points toward the other contour's centroid, that edge is facing inward. I'll sample points along these inner-facing edges and then compute the minimum, mean, and maximum distances between corresponding points on the two contours.\n\nImplementing this now...\n\nFor identifying which edges face inward, I need to handle that OpenCV contours can be oriented either clockwise or counterclockwise. Instead, I'll project each vertex onto the axis connecting the two centroids - vertices with higher projections are on the side facing the other contour, and those form the inner edges I need to measure. Writing the implementation...",
+      "timestamp": 1773000333068,
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\nimport math\nfrom itertools import combinations\n\n# --- CONFIGURATION ---\nTARGET_CATEGORY = \"Tab\"           # Category to analyze\nMIN_CONTOUR_AREA = 10             # Ignore contours smaller than this (pixels²)\nINNER_EDGE_HALF_ANGLE_DEG = 90.0  # Half-angle cone (degrees) around centroid axis\n                                   # that defines \"inner\" edge — 90° = entire facing hemisphere\nSAMPLE_SPACING_PX = 2             # Distance (px) between densely sampled points on inner edges\nCONTOUR_COLOR = \"#00FFFF\"         # Color for tab contour overlays\nINNER_EDGE_COLOR = \"#FF8800\"      # Color for inner-edge highlight overlays\nDIST_LINE_COLOR = \"#FF4444\"       # Color for min/max distance measurement lines\nMEAN_LINE_COLOR = \"#FFFF00\"       # Color for mean distance measurement line\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n\ndef compute_centroid(contour):\n    \"\"\"Compute the [x, y] centroid of a contour using image moments.\"\"\"\n    M = cv2.moments(contour)\n    if M[\"m00\"] == 0:\n        pts = contour.reshape(-1, 2)\n        return [float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1]))]\n    return [float(M[\"m10\"] / M[\"m00\"]), float(M[\"m01\"] / M[\"m00\"])]\n\n\ndef densify_contour_edges(contour, spacing_px):\n    \"\"\"\n    Densely sample points along all edges of a contour (polygon edges).\n    Returns an (N, 2) float64 array of sampled points.\n    \"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    n = len(pts)\n    sampled = []\n    for i in range(n):\n        a = pts[i]\n        b = pts[(i + 1) % n]\n        seg_len = float(np.linalg.norm(b - a))\n        if seg_len < 1e-6:\n            sampled.append(a)\n            continue\n        num_steps = max(1, int(math.ceil(seg_len / spacing_px)))\n        for t_idx in range(num_steps):\n            t = t_idx / num_steps\n            sampled.append(a + t * (b - a))\n    return np.array(sampled, dtype=np.float64)\n\n\ndef extract_inner_edge_points(contour, own_centroid, other_centroid,\n                               half_angle_deg, spacing_px):\n    \"\"\"\n    Extract densely sampled points from the 'inner' half of a contour —\n    the portion whose direction from the own centroid points within\n    half_angle_deg of the axis toward other_centroid.\n\n    Parameters\n    ----------\n    contour        : (N,1,2) int32 contour\n    own_centroid   : [cx, cy] of this contour\n    other_centroid : [cx, cy] of the other contour (defines inner direction)\n    half_angle_deg : half-cone angle to accept as \"inner\"\n    spacing_px     : point sampling interval along edges\n\n    Returns\n    -------\n    (M, 2) float64 array of inner-edge points\n    \"\"\"\n    cx, cy = own_centroid\n    ox, oy = other_centroid\n    axis = np.array([ox - cx, oy - cy], dtype=np.float64)\n    axis_len = np.linalg.norm(axis)\n    if axis_len < 1e-6:\n        # Degenerate — return all points\n        return densify_contour_edges(contour, spacing_px)\n    axis_unit = axis / axis_len\n    cos_thresh = math.cos(math.radians(half_angle_deg))\n\n    # Densify all edges first, then filter by direction from own centroid\n    all_pts = densify_contour_edges(contour, spacing_px)\n    inner = []\n    for pt in all_pts:\n        vec = pt - np.array([cx, cy], dtype=np.float64)\n        vec_len = np.linalg.norm(vec)\n        if vec_len < 1e-6:\n            continue\n        cos_angle = float(np.dot(vec / vec_len, axis_unit))\n        if cos_angle >= cos_thresh:\n            inner.append(pt)\n\n    if len(inner) == 0:\n        # Fallback: just return the closest 50% of all points to the other centroid\n        dists = np.linalg.norm(all_pts - np.array([ox, oy]), axis=1)\n        threshold = np.median(dists)\n        inner = all_pts[dists <= threshold].tolist()\n\n    return np.array(inner, dtype=np.float64)\n\n\ndef closest_point_on_segment(p, a, b):\n    \"\"\"Project point p onto segment a–b; return the closest point on the segment.\"\"\"\n    ab = b - a\n    denom = float(np.dot(ab, ab))\n    if denom < 1e-10:\n        return a.copy()\n    t = float(np.dot(p - a, ab) / denom)\n    t = max(0.0, min(1.0, t))\n    return a + t * ab\n\n\ndef point_to_contour_min_distance(pt, contour_pts):\n    \"\"\"\n    Compute the minimum distance from a single point to a set of polyline\n    points (using edge-segment projection for accuracy).\n    Returns (min_distance, nearest_point_on_contour).\n    \"\"\"\n    min_dist = float(\"inf\")\n    nearest = contour_pts[0]\n    n = len(contour_pts)\n    for j in range(n - 1):\n        proj = closest_point_on_segment(pt, contour_pts[j], contour_pts[j + 1])\n        d = float(np.linalg.norm(pt - proj))\n        if d < min_dist:\n            min_dist = d\n            nearest = proj\n    # Also check last→first closure\n    proj = closest_point_on_segment(pt, contour_pts[-1], contour_pts[0])\n    d = float(np.linalg.norm(pt - proj))\n    if d < min_dist:\n        min_dist = d\n        nearest = proj\n    return min_dist, nearest\n\n\ndef measure_inner_edge_distances(inner_pts_a, inner_pts_b):\n    \"\"\"\n    For every point on inner edge A, find the closest point on inner edge B\n    (via edge-segment projection). Returns a dict with min, mean, max distances\n    and the point pairs for those extremes.\n    \"\"\"\n    distances = []\n    nearest_on_b = []\n\n    for pt in inner_pts_a:\n        d, nb = point_to_contour_min_distance(pt, inner_pts_b)\n        distances.append(d)\n        nearest_on_b.append(nb)\n\n    distances = np.array(distances, dtype=np.float64)\n    idx_min = int(np.argmin(distances))\n    idx_max = int(np.argmax(distances))\n\n    # For mean: find the point on A whose distance is closest to the mean\n    mean_val = float(np.mean(distances))\n    idx_mean = int(np.argmin(np.abs(distances - mean_val)))\n\n    return {\n        \"min_dist_px\": round(float(distances[idx_min]), 2),\n        \"mean_dist_px\": round(mean_val, 2),\n        \"max_dist_px\": round(float(distances[idx_max]), 2),\n        \"min_pt_a\": [float(inner_pts_a[idx_min][0]), float(inner_pts_a[idx_min][1])],\n        \"min_pt_b\": [float(nearest_on_b[idx_min][0]), float(nearest_on_b[idx_min][1])],\n        \"max_pt_a\": [float(inner_pts_a[idx_max][0]), float(inner_pts_a[idx_max][1])],\n        \"max_pt_b\": [float(nearest_on_b[idx_max][0]), float(nearest_on_b[idx_max][1])],\n        \"mean_pt_a\": [float(inner_pts_a[idx_mean][0]), float(inner_pts_a[idx_mean][1])],\n        \"mean_pt_b\": [float(nearest_on_b[idx_mean][0]), float(nearest_on_b[idx_mean][1])],\n        \"sample_count\": int(len(distances)),\n    }\n\n\n# --- PIPELINE ---\n\ndef find_image_file():\n    \"\"\"Find the image file in INPUT_DIR (there is always exactly one).\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\n\ndef contour_from_annotation(ann):\n    \"\"\"Extract an int32 contour from a polygon segmentation annotation.\"\"\"\n    if not isinstance(ann[\"segmentation\"], list) or len(ann[\"segmentation\"]) == 0:\n        return None\n    seg = ann[\"segmentation\"][0]\n    contour = np.array(seg, dtype=np.float64).reshape(-1, 1, 2).astype(np.int32)\n    return contour\n\n\ndef build_overlays(ann_a, ann_b, contour_a, contour_b,\n                   inner_pts_a, inner_pts_b, result):\n    \"\"\"Build visual overlays: tab contours, inner edge highlights, distance lines.\"\"\"\n    overlays = []\n\n    # 1. Full tab contours (thin outline)\n    for ann, cnt in [(ann_a, contour_a), (ann_b, contour_b)]:\n        pts = [[int(p[0]), int(p[1])] for p in cnt.reshape(-1, 2).tolist()]\n        overlays.append({\n            \"type\": \"contours\",\n            \"points\": pts,\n            \"color\": CONTOUR_COLOR,\n            \"label\": f\"Tab {ann['id']}\",\n        })\n\n    # 2. Inner edge polylines (open path along inner-facing edge points)\n    for inner_pts, color, label in [\n        (inner_pts_a, INNER_EDGE_COLOR, f\"Inner edge Tab {ann_a['id']}\"),\n        (inner_pts_b, INNER_EDGE_COLOR, f\"Inner edge Tab {ann_b['id']}\"),\n    ]:\n        # Subsample for overlay clarity (every 5th point)\n        step = max(1, len(inner_pts) // 200)\n        pts_overlay = [[float(p[0]), float(p[1])] for p in inner_pts[::step]]\n        overlays.append({\n            \"type\": \"polyline\",\n            \"points\": pts_overlay,\n            \"color\": color,\n            \"width\": 3,\n            \"dashed\": False,\n            \"label\": label,\n        })\n\n    # 3. Measurement lines: min, mean, max\n    measure_lines = [\n        (result[\"min_pt_a\"],  result[\"min_pt_b\"],  result[\"min_dist_px\"],  DIST_LINE_COLOR, \"Min\"),\n        (result[\"mean_pt_a\"], result[\"mean_pt_b\"],  result[\"mean_dist_px\"], MEAN_LINE_COLOR, \"Mean\"),\n        (result[\"max_pt_a\"],  result[\"max_pt_b\"],   result[\"max_dist_px\"],  DIST_LINE_COLOR, \"Max\"),\n    ]\n    lines = []\n    for pt_a, pt_b, val, color, tag in measure_lines:\n        lines.append({\n            \"start\": [float(pt_a[0]), float(pt_a[1])],\n            \"end\":   [float(pt_b[0]), float(pt_b[1])],\n            \"value\": f\"{tag}: {val:.1f} px\",\n            \"color\": color,\n        })\n    overlays.append({\"type\": \"measurements\", \"lines\": lines})\n\n    return overlays\n\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        print(\"ERROR: Failed to load image.\")\n        result = {\"overlays\": [], \"metrics\": {\"error\": \"Image load failed\"},\n                  \"ctq_results\": [], \"stdout\": \"\"}\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Filter to target category\n    tab_anns = [a for a in coco[\"annotations\"]\n                if cat_map.get(a[\"category_id\"], \"\") == TARGET_CATEGORY]\n\n    if len(tab_anns) < 2:\n        msg = (f\"Found {len(tab_anns)} '{TARGET_CATEGORY}' annotation(s); \"\n               f\"need at least 2.\")\n        print(f\"WARNING: {msg}\")\n        result = {\"overlays\": [], \"metrics\": {\"error\": msg},\n                  \"ctq_results\": [], \"stdout\": msg}\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Build valid contours\n    contour_map = {}\n    valid_anns = []\n    for ann in tab_anns:\n        cnt = contour_from_annotation(ann)\n        if cnt is None:\n            continue\n        if float(cv2.contourArea(cnt)) < MIN_CONTOUR_AREA:\n            continue\n        contour_map[ann[\"id\"]] = cnt\n        valid_anns.append(ann)\n\n    if len(valid_anns) < 2:\n        msg = (f\"Fewer than 2 valid '{TARGET_CATEGORY}' contours after area filtering.\")\n        print(f\"WARNING: {msg}\")\n        result = {\"overlays\": [], \"metrics\": {\"error\": msg},\n                  \"ctq_results\": [], \"stdout\": msg}\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Process all pairs\n    ctq_results = []\n    all_overlays = []\n    pair_idx = 0\n\n    for (ann_a, ann_b) in combinations(valid_anns, 2):\n        pair_idx += 1\n        cnt_a = contour_map[ann_a[\"id\"]]\n        cnt_b = contour_map[ann_b[\"id\"]]\n\n        centroid_a = compute_centroid(cnt_a)\n        centroid_b = compute_centroid(cnt_b)\n\n        # Extract inner-facing edge points for each tab\n        inner_pts_a = extract_inner_edge_points(\n            cnt_a, centroid_a, centroid_b,\n            INNER_EDGE_HALF_ANGLE_DEG, SAMPLE_SPACING_PX)\n        inner_pts_b = extract_inner_edge_points(\n            cnt_b, centroid_b, centroid_a,\n            INNER_EDGE_HALF_ANGLE_DEG, SAMPLE_SPACING_PX)\n\n        if len(inner_pts_a) == 0 or len(inner_pts_b) == 0:\n            print(f\"WARNING: Could not extract inner edge points for pair \"\n                  f\"(Tab {ann_a['id']}, Tab {ann_b['id']}). Skipping.\")\n            continue\n\n        # Measure min/mean/max distance between inner edges\n        dist_result = measure_inner_edge_distances(inner_pts_a, inner_pts_b)\n\n        ctq_results.append({\n            \"feature_id\": pair_idx,\n            \"label\": f\"tab_inner_pair_{pair_idx:03d}\",\n            \"category\": TARGET_CATEGORY,\n            \"ann_id_a\": int(ann_a[\"id\"]),\n            \"ann_id_b\": int(ann_b[\"id\"]),\n            \"measurements\": {\n                \"min_inner_edge_dist_px\":  dist_result[\"min_dist_px\"],\n                \"mean_inner_edge_dist_px\": dist_result[\"mean_dist_px\"],\n                \"max_inner_edge_dist_px\":  dist_result[\"max_dist_px\"],\n            },\n        })\n\n        pair_overlays = build_overlays(\n            ann_a, ann_b, cnt_a, cnt_b,\n            inner_pts_a, inner_pts_b, dist_result)\n        all_overlays.extend(pair_overlays)\n\n    if not ctq_results:\n        msg = \"No valid tab pairs could be measured.\"\n        print(f\"WARNING: {msg}\")\n        result = {\"overlays\": [], \"metrics\": {\"error\": msg},\n                  \"ctq_results\": [], \"stdout\": msg}\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Summary metrics across all pairs\n    all_mins  = [r[\"measurements\"][\"min_inner_edge_dist_px\"]  for r in ctq_results]\n    all_means = [r[\"measurements\"][\"mean_inner_edge_dist_px\"] for r in ctq_results]\n    all_maxs  = [r[\"measurements\"][\"max_inner_edge_dist_px\"]  for r in ctq_results]\n\n    metrics = {\n        \"tab_count\":                    int(len(valid_anns)),\n        \"pair_count\":                   int(len(ctq_results)),\n        \"overall_min_inner_dist_px\":    round(float(min(all_mins)),  2),\n        \"overall_mean_inner_dist_px\":   round(float(sum(all_means) / len(all_means)), 2),\n        \"overall_max_inner_dist_px\":    round(float(max(all_maxs)),  2),\n        \"inner_edge_half_angle_deg\":    float(INNER_EDGE_HALF_ANGLE_DEG),\n        \"sample_spacing_px\":            float(SAMPLE_SPACING_PX),\n    }\n\n    result = {\n        \"overlays\":    all_overlays,\n        \"metrics\":     metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\":      \"\",\n    }\n\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n\n    print(\n        f\"Processed {len(valid_anns)} '{TARGET_CATEGORY}' tabs → \"\n        f\"{len(ctq_results)} pair(s). \"\n        f\"Inner-edge distances — \"\n        f\"min: {metrics['overall_min_inner_dist_px']:.1f} px, \"\n        f\"mean: {metrics['overall_mean_inner_dist_px']:.1f} px, \"\n        f\"max: {metrics['overall_max_inner_dist_px']:.1f} px.\"\n    )\n\nmain()"
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 1 features measured.",
+      "timestamp": 1773000414444
+    },
+    {
+      "role": "user",
+      "content": "The inner edge should only be near vertical, the horizontal edges are not part of the inner edge",
+      "timestamp": 1773000464798
+    },
+    {
+      "role": "assistant",
+      "content": "That's an important refinement. To isolate only the **near-vertical inner edge segments**, the algorithm should:\n\n- Sample points along each Tab's contour and **filter to only those segments where the edge normal is predominantly horizontal** (i.e., the edge itself runs near-vertically, within some angular threshold like ±20° from vertical)\n- This excludes the top and bottom horizontal edges of each tab, keeping only the vertical facing sides that look across the gap toward the other tab\n\nThis will give a much tighter, more meaningful distribution of distances — the **min** will be the narrowest point of the gap, the **max** the widest, and the **mean** an average gap width along the vertical span of the tabs.\n\nWhen you're ready, click **Generate** and describe it as: *\"measure min, mean, and max distance between the near-vertical inner edges of the two Tab annotations only\"* so the code filters contour segments by orientation before computing distances.",
+      "timestamp": 1773000464798
+    },
+    {
+      "role": "user",
+      "content": "To isolate only the **near-vertical inner edge segments**, the algorithm should:\n\n- Sample points along each Tab's contour and **filter to only those segments where the edge normal is predominantly horizontal** (i.e., the edge itself runs near-vertically, within some angular threshold like ±20° from vertical)\n- This excludes the top and bottom horizontal edges of each tab, keeping only the vertical facing sides that look across the gap toward the other tab\n\nThis will give a much tighter, more meaningful distribution of distances — the **min** will be the narrowest point of the gap, the **max** the widest, and the **mean** an average gap width along the vertical span of the tabs.\n\nWhen you're ready, click **Generate** and describe it as: *\"measure min, mean, and max distance between the near-vertical inner edges of the two Tab annotations only\"* so the code filters contour segments by orientation before computing distances.",
+      "timestamp": 1773000483563
+    },
+    {
+      "role": "assistant",
+      "content": "Targeting the two \"Tab\" annotations and measuring min, mean, and max gap distances between their near-vertical inner-facing edge segments. The approach filters each contour's segments in two passes: first keeping only segments whose direction is within ±VERTICAL_ANGLE_THRESH_DEG of vertical (eliminating top/bottom horizontal edges), then applying the existing inner-hemisphere filter to retain only the side that faces toward the other tab. This yields a tight, meaningful gap-width distribution along the true vertical span of the tabs.",
+      "thinking": "The user wants to modify the previous code to filter contour segments by edge orientation — specifically keeping only near-vertical edge segments (within ±20° from vertical) when computing inner edge distances between the two Tab annotations.\n\nThe key change is in how we filter edge segments:\n- Instead of filtering by angular direction from centroid, we filter by the edge normal orientation\n- A near-vertical edge has a predominantly horizontal normal\n- The edge direction vector for a segment from point A to point B is (B-A)\n- The edge normal is perpendicular to this: (-dy, dx) or (dy, -dx)\n- If the edge runs near-vertically, the edge direction is close to (0, ±1), so the normal is close to (±1, 0) — predominantly horizontal\n\n\n- For each segment, I'll compute the edge direction vector and measure its angle from vertical using arctan(|dx| / |dy|), then keep only those segments where this angle falls within the threshold, before sampling points from the filtered edges.\n\nWriting helper functions... Writing the sampling function...\n\nNow I'm completing the logic to extract inner edges by first identifying near-vertical segments, then filtering those that face inward toward the other tab. I'll add configuration constants for the vertical angle threshold and combine both filters to get the segments I need.",
+      "timestamp": 1773000483562,
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\nimport math\nfrom itertools import combinations\n\n# --- CONFIGURATION ---\nTARGET_CATEGORY = \"Tab\"             # Category to analyze\nMIN_CONTOUR_AREA = 10               # Ignore contours smaller than this (pixels²)\nVERTICAL_ANGLE_THRESH_DEG = 20.0    # Max degrees from vertical for a segment to be\n                                    # considered \"near-vertical\" (excludes top/bottom edges)\nINNER_EDGE_HALF_ANGLE_DEG = 90.0    # Half-angle cone (degrees) around centroid axis\n                                    # that defines \"inner\" edge — 90° = entire facing hemisphere\nSAMPLE_SPACING_PX = 2               # Distance (px) between densely sampled points on edges\nCONTOUR_COLOR = \"#00FFFF\"           # Color for tab contour overlays\nINNER_EDGE_COLOR = \"#FF8800\"        # Color for near-vertical inner-edge highlights\nDIST_LINE_COLOR = \"#FF4444\"         # Color for min/max distance measurement lines\nMEAN_LINE_COLOR = \"#FFFF00\"         # Color for mean distance measurement line\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n\ndef compute_centroid(contour):\n    \"\"\"Compute the [x, y] centroid of a contour using image moments.\"\"\"\n    M = cv2.moments(contour)\n    if M[\"m00\"] == 0:\n        pts = contour.reshape(-1, 2)\n        return [float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1]))]\n    return [float(M[\"m10\"] / M[\"m00\"]), float(M[\"m01\"] / M[\"m00\"])]\n\n\ndef is_segment_near_vertical(a, b, angle_thresh_deg):\n    \"\"\"\n    Return True if segment a→b runs within angle_thresh_deg of vertical.\n    A perfectly vertical segment has direction (0, ±1); angle from vertical = 0°.\n    A perfectly horizontal segment has angle from vertical = 90°.\n    \"\"\"\n    dx = float(b[0] - a[0])\n    dy = float(b[1] - a[1])\n    seg_len = math.sqrt(dx * dx + dy * dy)\n    if seg_len < 1e-6:\n        return False\n    # cos(angle from vertical) = |dy| / seg_len\n    cos_from_vertical = abs(dy) / seg_len\n    angle_from_vertical_deg = math.degrees(math.acos(min(1.0, cos_from_vertical)))\n    return angle_from_vertical_deg <= angle_thresh_deg\n\n\ndef densify_near_vertical_segments(contour, spacing_px, angle_thresh_deg):\n    \"\"\"\n    Sample points densely only along near-vertical edge segments of a contour.\n    Segments outside the vertical angle threshold are skipped entirely.\n\n    Parameters\n    ----------\n    contour          : (N,1,2) int32 contour\n    spacing_px       : sampling interval in pixels\n    angle_thresh_deg : max degrees from vertical to accept a segment\n\n    Returns\n    -------\n    (M, 2) float64 array of sampled points, or empty (0,2) array if none qualify.\n    \"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    n = len(pts)\n    sampled = []\n    for i in range(n):\n        a = pts[i]\n        b = pts[(i + 1) % n]\n        if not is_segment_near_vertical(a, b, angle_thresh_deg):\n            continue\n        seg_len = float(np.linalg.norm(b - a))\n        if seg_len < 1e-6:\n            sampled.append(a.tolist())\n            continue\n        num_steps = max(1, int(math.ceil(seg_len / spacing_px)))\n        for t_idx in range(num_steps):\n            t = t_idx / num_steps\n            sampled.append((a + t * (b - a)).tolist())\n    if not sampled:\n        return np.zeros((0, 2), dtype=np.float64)\n    return np.array(sampled, dtype=np.float64)\n\n\ndef filter_inner_facing_points(pts, own_centroid, other_centroid, half_angle_deg):\n    \"\"\"\n    From a set of 2-D points, keep only those whose direction from own_centroid\n    falls within half_angle_deg of the axis pointing toward other_centroid.\n\n    Parameters\n    ----------\n    pts            : (N, 2) float64 array\n    own_centroid   : [cx, cy]\n    other_centroid : [cx, cy] — defines the \"inner\" direction\n    half_angle_deg : acceptance half-cone angle in degrees\n\n    Returns\n    -------\n    (M, 2) float64 array of retained points.\n    \"\"\"\n    if len(pts) == 0:\n        return pts\n    cx, cy = float(own_centroid[0]), float(own_centroid[1])\n    ox, oy = float(other_centroid[0]), float(other_centroid[1])\n    axis = np.array([ox - cx, oy - cy], dtype=np.float64)\n    axis_len = float(np.linalg.norm(axis))\n    if axis_len < 1e-6:\n        return pts  # degenerate — keep all\n    axis_unit = axis / axis_len\n    cos_thresh = math.cos(math.radians(half_angle_deg))\n\n    vecs = pts - np.array([cx, cy], dtype=np.float64)\n    norms = np.linalg.norm(vecs, axis=1, keepdims=True)\n    valid_mask = norms[:, 0] > 1e-6\n    cos_angles = np.where(\n        valid_mask,\n        (vecs / np.where(valid_mask[:, np.newaxis], norms, 1.0)) @ axis_unit,\n        -1.0,\n    )\n    inner_mask = cos_angles >= cos_thresh\n    return pts[inner_mask]\n\n\ndef extract_near_vertical_inner_edge_points(contour, own_centroid, other_centroid,\n                                             vertical_angle_thresh_deg,\n                                             inner_half_angle_deg,\n                                             spacing_px):\n    \"\"\"\n    Extract points from a contour that satisfy BOTH criteria:\n      1. Lie on a near-vertical edge segment (orientation filter)\n      2. Face toward the other contour (inner-hemisphere filter)\n\n    Falls back to all near-vertical points if the combined filter yields nothing.\n\n    Returns\n    -------\n    (M, 2) float64 array\n    \"\"\"\n    # Step 1: sample points only from near-vertical segments\n    vert_pts = densify_near_vertical_segments(contour, spacing_px, vertical_angle_thresh_deg)\n\n    if len(vert_pts) == 0:\n        return vert_pts  # no near-vertical segments found\n\n    # Step 2: keep only inner-facing points\n    inner_pts = filter_inner_facing_points(\n        vert_pts, own_centroid, other_centroid, inner_half_angle_deg)\n\n    if len(inner_pts) == 0:\n        # Fallback: return all near-vertical points regardless of hemisphere\n        return vert_pts\n\n    return inner_pts\n\n\ndef closest_point_on_segment(p, a, b):\n    \"\"\"Project point p onto segment a–b; return the closest point on the segment.\"\"\"\n    ab = b - a\n    denom = float(np.dot(ab, ab))\n    if denom < 1e-10:\n        return a.copy()\n    t = float(np.dot(p - a, ab) / denom)\n    t = max(0.0, min(1.0, t))\n    return a + t * ab\n\n\ndef point_to_pointset_min_distance(pt, target_pts):\n    \"\"\"\n    Compute the minimum distance from a single point to a polyline defined by\n    target_pts, using edge-segment projection for sub-pixel accuracy.\n\n    Returns (min_distance, nearest_point_on_target).\n    \"\"\"\n    min_dist = float(\"inf\")\n    nearest = target_pts[0].copy()\n    n = len(target_pts)\n    for j in range(n - 1):\n        proj = closest_point_on_segment(pt, target_pts[j], target_pts[j + 1])\n        d = float(np.linalg.norm(pt - proj))\n        if d < min_dist:\n            min_dist = d\n            nearest = proj.copy()\n    # Wrap-around closure\n    proj = closest_point_on_segment(pt, target_pts[-1], target_pts[0])\n    d = float(np.linalg.norm(pt - proj))\n    if d < min_dist:\n        min_dist = d\n        nearest = proj.copy()\n    return min_dist, nearest\n\n\ndef measure_edge_distances(inner_pts_a, inner_pts_b):\n    \"\"\"\n    For every point on edge A, find the closest point on edge B.\n    Returns a dict with min, mean, max distances and the paired points\n    used for visualizing each landmark distance.\n    \"\"\"\n    distances = []\n    nearest_on_b = []\n\n    for pt in inner_pts_a:\n        d, nb = point_to_pointset_min_distance(pt, inner_pts_b)\n        distances.append(d)\n        nearest_on_b.append(nb)\n\n    distances = np.array(distances, dtype=np.float64)\n    idx_min = int(np.argmin(distances))\n    idx_max = int(np.argmax(distances))\n    mean_val = float(np.mean(distances))\n    idx_mean = int(np.argmin(np.abs(distances - mean_val)))\n\n    return {\n        \"min_dist_px\":    round(float(distances[idx_min]), 2),\n        \"mean_dist_px\":   round(mean_val, 2),\n        \"max_dist_px\":    round(float(distances[idx_max]), 2),\n        \"min_pt_a\":  [float(inner_pts_a[idx_min][0]),  float(inner_pts_a[idx_min][1])],\n        \"min_pt_b\":  [float(nearest_on_b[idx_min][0]), float(nearest_on_b[idx_min][1])],\n        \"max_pt_a\":  [float(inner_pts_a[idx_max][0]),  float(inner_pts_a[idx_max][1])],\n        \"max_pt_b\":  [float(nearest_on_b[idx_max][0]), float(nearest_on_b[idx_max][1])],\n        \"mean_pt_a\": [float(inner_pts_a[idx_mean][0]), float(inner_pts_a[idx_mean][1])],\n        \"mean_pt_b\": [float(nearest_on_b[idx_mean][0]),float(nearest_on_b[idx_mean][1])],\n        \"sample_count\": int(len(distances)),\n    }\n\n\n# --- PIPELINE ---\n\ndef find_image_file():\n    \"\"\"Find the image file in INPUT_DIR (there is always exactly one).\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\n\ndef contour_from_annotation(ann):\n    \"\"\"Extract an int32 contour from a polygon segmentation annotation.\"\"\"\n    if not isinstance(ann[\"segmentation\"], list) or len(ann[\"segmentation\"]) == 0:\n        return None\n    seg = ann[\"segmentation\"][0]\n    return np.array(seg, dtype=np.float64).reshape(-1, 1, 2).astype(np.int32)\n\n\ndef build_overlays(ann_a, ann_b, contour_a, contour_b,\n                   inner_pts_a, inner_pts_b, dist_result):\n    \"\"\"Build visual overlays: tab contours, near-vertical inner edges, distance lines.\"\"\"\n    overlays = []\n\n    # 1. Full tab contour outlines\n    for ann, cnt in [(ann_a, contour_a), (ann_b, contour_b)]:\n        pts = [[int(p[0][0]), int(p[0][1])] for p in cnt.tolist()]\n        overlays.append({\n            \"type\": \"contours\",\n            \"points\": pts,\n            \"color\": CONTOUR_COLOR,\n            \"label\": f\"Tab {ann['id']}\",\n        })\n\n    # 2. Near-vertical inner edge polylines\n    for inner_pts, label in [\n        (inner_pts_a, f\"Vert. inner edge Tab {ann_a['id']}\"),\n        (inner_pts_b, f\"Vert. inner edge Tab {ann_b['id']}\"),\n    ]:\n        # Subsample for overlay clarity (at most ~300 points)\n        step = max(1, len(inner_pts) // 300)\n        pts_overlay = [[float(p[0]), float(p[1])] for p in inner_pts[::step]]\n        overlays.append({\n            \"type\": \"polyline\",\n            \"points\": pts_overlay,\n            \"color\": INNER_EDGE_COLOR,\n            \"width\": 3,\n            \"dashed\": False,\n            \"label\": label,\n        })\n\n    # 3. Min / mean / max gap measurement lines\n    lines = []\n    for pt_a, pt_b, val, color, tag in [\n        (dist_result[\"min_pt_a\"],  dist_result[\"min_pt_b\"],  dist_result[\"min_dist_px\"],  DIST_LINE_COLOR, \"Min\"),\n        (dist_result[\"mean_pt_a\"], dist_result[\"mean_pt_b\"], dist_result[\"mean_dist_px\"], MEAN_LINE_COLOR, \"Mean\"),\n        (dist_result[\"max_pt_a\"],  dist_result[\"max_pt_b\"],  dist_result[\"max_dist_px\"],  DIST_LINE_COLOR, \"Max\"),\n    ]:\n        lines.append({\n            \"start\": [float(pt_a[0]), float(pt_a[1])],\n            \"end\":   [float(pt_b[0]), float(pt_b[1])],\n            \"value\": f\"{tag}: {val:.1f} px\",\n            \"color\": color,\n        })\n    overlays.append({\"type\": \"measurements\", \"lines\": lines})\n\n    return overlays\n\n\ndef write_result(overlays, metrics, ctq_results, stdout_msg=\"\"):\n    result = {\n        \"overlays\":    overlays,\n        \"metrics\":     metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\":      stdout_msg,\n    }\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        msg = \"ERROR: Failed to load image.\"\n        print(msg)\n        write_result([], {\"error\": \"Image load failed\"}, [], msg)\n        return\n\n    # Filter to target category\n    tab_anns = [a for a in coco[\"annotations\"]\n                if cat_map.get(a[\"category_id\"], \"\") == TARGET_CATEGORY]\n\n    if len(tab_anns) < 2:\n        msg = (f\"Found {len(tab_anns)} '{TARGET_CATEGORY}' annotation(s); need at least 2.\")\n        print(f\"WARNING: {msg}\")\n        write_result([], {\"error\": msg}, [], msg)\n        return\n\n    # Build valid contours\n    contour_map = {}\n    valid_anns = []\n    for ann in tab_anns:\n        cnt = contour_from_annotation(ann)\n        if cnt is None:\n            continue\n        if float(cv2.contourArea(cnt)) < MIN_CONTOUR_AREA:\n            continue\n        contour_map[ann[\"id\"]] = cnt\n        valid_anns.append(ann)\n\n    if len(valid_anns) < 2:\n        msg = f\"Fewer than 2 valid '{TARGET_CATEGORY}' contours after area filtering.\"\n        print(f\"WARNING: {msg}\")\n        write_result([], {\"error\": msg}, [], msg)\n        return\n\n    ctq_results = []\n    all_overlays = []\n    pair_idx = 0\n\n    for (ann_a, ann_b) in combinations(valid_anns, 2):\n        pair_idx += 1\n        cnt_a = contour_map[ann_a[\"id\"]]\n        cnt_b = contour_map[ann_b[\"id\"]]\n\n        centroid_a = compute_centroid(cnt_a)\n        centroid_b = compute_centroid(cnt_b)\n\n        # Extract near-vertical + inner-facing edge points for each tab\n        inner_pts_a = extract_near_vertical_inner_edge_points(\n            cnt_a, centroid_a, centroid_b,\n            VERTICAL_ANGLE_THRESH_DEG, INNER_EDGE_HALF_ANGLE_DEG, SAMPLE_SPACING_PX)\n\n        inner_pts_b = extract_near_vertical_inner_edge_points(\n            cnt_b, centroid_b, centroid_a,\n            VERTICAL_ANGLE_THRESH_DEG, INNER_EDGE_HALF_ANGLE_DEG, SAMPLE_SPACING_PX)\n\n        if len(inner_pts_a) == 0 or len(inner_pts_b) == 0:\n            msg = (f\"WARNING: No near-vertical inner-edge points found for pair \"\n                   f\"(Tab {ann_a['id']}, Tab {ann_b['id']}). \"\n                   f\"Try increasing VERTICAL_ANGLE_THRESH_DEG (currently {VERTICAL_ANGLE_THRESH_DEG}°).\")\n            print(msg)\n            continue\n\n        dist_result = measure_edge_distances(inner_pts_a, inner_pts_b)\n\n        ctq_results.append({\n            \"feature_id\": pair_idx,\n            \"label\": f\"tab_vert_inner_pair_{pair_idx:03d}\",\n            \"category\": TARGET_CATEGORY,\n            \"ann_id_a\": int(ann_a[\"id\"]),\n            \"ann_id_b\": int(ann_b[\"id\"]),\n            \"measurements\": {\n                \"min_inner_edge_dist_px\":  dist_result[\"min_dist_px\"],\n                \"mean_inner_edge_dist_px\": dist_result[\"mean_dist_px\"],\n                \"max_inner_edge_dist_px\":  dist_result[\"max_dist_px\"],\n                \"sample_count\":            dist_result[\"sample_count\"],\n            },\n        })\n\n        pair_overlays = build_overlays(\n            ann_a, ann_b, cnt_a, cnt_b, inner_pts_a, inner_pts_b, dist_result)\n        all_overlays.extend(pair_overlays)\n\n    if not ctq_results:\n        msg = \"No valid tab pairs could be measured with the current vertical angle threshold.\"\n        print(f\"WARNING: {msg}\")\n        write_result([], {\"error\": msg}, [], msg)\n        return\n\n    all_mins  = [r[\"measurements\"][\"min_inner_edge_dist_px\"]  for r in ctq_results]\n    all_means = [r[\"measurements\"][\"mean_inner_edge_dist_px\"] for r in ctq_results]\n    all_maxs  = [r[\"measurements\"][\"max_inner_edge_dist_px\"]  for r in ctq_results]\n\n    metrics = {\n        \"tab_count\":                     int(len(valid_anns)),\n        \"pair_count\":                    int(len(ctq_results)),\n        \"overall_min_inner_dist_px\":     round(float(min(all_mins)),  2),\n        \"overall_mean_inner_dist_px\":    round(float(sum(all_means) / len(all_means)), 2),\n        \"overall_max_inner_dist_px\":     round(float(max(all_maxs)),  2),\n        \"vertical_angle_thresh_deg\":     float(VERTICAL_ANGLE_THRESH_DEG),\n        \"inner_edge_half_angle_deg\":     float(INNER_EDGE_HALF_ANGLE_DEG),\n        \"sample_spacing_px\":             float(SAMPLE_SPACING_PX),\n    }\n\n    write_result(all_overlays, metrics, ctq_results)\n\n    print(\n        f\"Processed {len(valid_anns)} '{TARGET_CATEGORY}' tabs → {len(ctq_results)} pair(s) \"\n        f\"using near-vertical segments (±{VERTICAL_ANGLE_THRESH_DEG}° from vertical). \"\n        f\"Gap distances — \"\n        f\"min: {metrics['overall_min_inner_dist_px']:.1f} px, \"\n        f\"mean: {metrics['overall_mean_inner_dist_px']:.1f} px, \"\n        f\"max: {metrics['overall_max_inner_dist_px']:.1f} px.\"\n    )\n\n\nmain()"
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 1 features measured.",
+      "timestamp": 1773000566418
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 1 features measured.",
+      "timestamp": 1773000574733
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 1 features measured.",
+      "timestamp": 1773000579265
+    }
+  ],
+  "last_result": {
+    "overlays": [
+      {
+        "type": "contours",
+        "points": [
+          [
+            620,
+            130
+          ],
+          [
+            617,
+            139
+          ],
+          [
+            616,
+            197
+          ],
+          [
+            613,
+            213
+          ],
+          [
+            601,
+            223
+          ],
+          [
+            656,
+            226
+          ],
+          [
+            709,
+            224
+          ],
+          [
+            710,
+            222
+          ],
+          [
+            706,
+            216
+          ],
+          [
+            704,
+            203
+          ],
+          [
+            704,
+            130
+          ]
+        ],
+        "color": "#00FFFF",
+        "label": "Tab 1"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            848,
+            129
+          ],
+          [
+            845,
+            133
+          ],
+          [
+            846,
+            195
+          ],
+          [
+            844,
+            216
+          ],
+          [
+            836,
+            223
+          ],
+          [
+            866,
+            226
+          ],
+          [
+            939,
+            225
+          ],
+          [
+            940,
+            222
+          ],
+          [
+            935,
+            215
+          ],
+          [
+            933,
+            201
+          ],
+          [
+            933,
+            143
+          ],
+          [
+            931,
+            134
+          ],
+          [
+            918,
+            130
+          ]
+        ],
+        "color": "#00FFFF",
+        "label": "Tab 2"
+      },
+      {
+        "type": "polyline",
+        "points": [
+          [
+            709,
+            224
+          ],
+          [
+            709.5,
+            223
+          ],
+          [
+            710,
+            222
+          ],
+          [
+            709,
+            220.5
+          ],
+          [
+            708,
+            219
+          ],
+          [
+            707,
+            217.5
+          ],
+          [
+            706,
+            216
+          ],
+          [
+            705.7142857142857,
+            214.14285714285714
+          ],
+          [
+            705.4285714285714,
+            212.28571428571428
+          ],
+          [
+            705.1428571428571,
+            210.42857142857142
+          ],
+          [
+            704.8571428571429,
+            208.57142857142858
+          ],
+          [
+            704.5714285714286,
+            206.71428571428572
+          ],
+          [
+            704.2857142857143,
+            204.85714285714286
+          ],
+          [
+            704,
+            203
+          ],
+          [
+            704,
+            201.02702702702703
+          ],
+          [
+            704,
+            199.05405405405406
+          ],
+          [
+            704,
+            197.0810810810811
+          ],
+          [
+            704,
+            195.1081081081081
+          ],
+          [
+            704,
+            193.13513513513513
+          ],
+          [
+            704,
+            191.16216216216216
+          ],
+          [
+            704,
+            189.1891891891892
+          ],
+          [
+            704,
+            187.21621621621622
+          ],
+          [
+            704,
+            185.24324324324323
+          ],
+          [
+            704,
+            183.27027027027026
+          ],
+          [
+            704,
+            181.2972972972973
+          ],
+          [
+            704,
+            179.32432432432432
+          ],
+          [
+            704,
+            177.35135135135135
+          ],
+          [
+            704,
+            175.3783783783784
+          ],
+          [
+            704,
+            173.40540540540542
+          ],
+          [
+            704,
+            171.43243243243242
+          ],
+          [
+            704,
+            169.45945945945945
+          ],
+          [
+            704,
+            167.48648648648648
+          ],
+          [
+            704,
+            165.51351351351352
+          ],
+          [
+            704,
+            163.54054054054055
+          ],
+          [
+            704,
+            161.56756756756758
+          ],
+          [
+            704,
+            159.59459459459458
+          ],
+          [
+            704,
+            157.6216216216216
+          ],
+          [
+            704,
+            155.64864864864865
+          ],
+          [
+            704,
+            153.67567567567568
+          ],
+          [
+            704,
+            151.7027027027027
+          ],
+          [
+            704,
+            149.72972972972974
+          ],
+          [
+            704,
+            147.75675675675674
+          ],
+          [
+            704,
+            145.78378378378378
+          ],
+          [
+            704,
+            143.8108108108108
+          ],
+          [
+            704,
+            141.83783783783784
+          ],
+          [
+            704,
+            139.86486486486487
+          ],
+          [
+            704,
+            137.89189189189187
+          ],
+          [
+            704,
+            135.9189189189189
+          ],
+          [
+            704,
+            133.94594594594594
+          ],
+          [
+            704,
+            131.97297297297297
+          ]
+        ],
+        "color": "#FF8800",
+        "width": 3,
+        "dashed": false,
+        "label": "Vert. inner edge Tab 1"
+      },
+      {
+        "type": "polyline",
+        "points": [
+          [
+            848,
+            129
+          ],
+          [
+            847,
+            130.33333333333334
+          ],
+          [
+            846,
+            131.66666666666666
+          ],
+          [
+            845,
+            133
+          ],
+          [
+            845.03125,
+            134.9375
+          ],
+          [
+            845.0625,
+            136.875
+          ],
+          [
+            845.09375,
+            138.8125
+          ],
+          [
+            845.125,
+            140.75
+          ],
+          [
+            845.15625,
+            142.6875
+          ],
+          [
+            845.1875,
+            144.625
+          ],
+          [
+            845.21875,
+            146.5625
+          ],
+          [
+            845.25,
+            148.5
+          ],
+          [
+            845.28125,
+            150.4375
+          ],
+          [
+            845.3125,
+            152.375
+          ],
+          [
+            845.34375,
+            154.3125
+          ],
+          [
+            845.375,
+            156.25
+          ],
+          [
+            845.40625,
+            158.1875
+          ],
+          [
+            845.4375,
+            160.125
+          ],
+          [
+            845.46875,
+            162.0625
+          ],
+          [
+            845.5,
+            164
+          ],
+          [
+            845.53125,
+            165.9375
+          ],
+          [
+            845.5625,
+            167.875
+          ],
+          [
+            845.59375,
+            169.8125
+          ],
+          [
+            845.625,
+            171.75
+          ],
+          [
+            845.65625,
+            173.6875
+          ],
+          [
+            845.6875,
+            175.625
+          ],
+          [
+            845.71875,
+            177.5625
+          ],
+          [
+            845.75,
+            179.5
+          ],
+          [
+            845.78125,
+            181.4375
+          ],
+          [
+            845.8125,
+            183.375
+          ],
+          [
+            845.84375,
+            185.3125
+          ],
+          [
+            845.875,
+            187.25
+          ],
+          [
+            845.90625,
+            189.1875
+          ],
+          [
+            845.9375,
+            191.125
+          ],
+          [
+            845.96875,
+            193.0625
+          ],
+          [
+            846,
+            195
+          ],
+          [
+            845.8181818181819,
+            196.9090909090909
+          ],
+          [
+            845.6363636363636,
+            198.8181818181818
+          ],
+          [
+            845.4545454545455,
+            200.72727272727272
+          ],
+          [
+            845.2727272727273,
+            202.63636363636363
+          ],
+          [
+            845.0909090909091,
+            204.54545454545453
+          ],
+          [
+            844.9090909090909,
+            206.45454545454544
+          ],
+          [
+            844.7272727272727,
+            208.36363636363637
+          ],
+          [
+            844.5454545454545,
+            210.27272727272728
+          ],
+          [
+            844.3636363636364,
+            212.1818181818182
+          ],
+          [
+            844.1818181818181,
+            214.0909090909091
+          ],
+          [
+            844,
+            216
+          ],
+          [
+            842.6666666666666,
+            217.16666666666666
+          ],
+          [
+            841.3333333333334,
+            218.33333333333334
+          ],
+          [
+            840,
+            219.5
+          ],
+          [
+            838.6666666666666,
+            220.66666666666666
+          ],
+          [
+            837.3333333333334,
+            221.83333333333334
+          ]
+        ],
+        "color": "#FF8800",
+        "width": 3,
+        "dashed": false,
+        "label": "Vert. inner edge Tab 2"
+      },
+      {
+        "type": "measurements",
+        "lines": [
+          {
+            "start": [
+              710,
+              222
+            ],
+            "end": [
+              837.3333333333334,
+              221.83333333333334
+            ],
+            "value": "Min: 127.3 px",
+            "color": "#FF4444"
+          },
+          {
+            "start": [
+              704,
+              187.21621621621622
+            ],
+            "end": [
+              839.521685804846,
+              202.7878282296994
+            ],
+            "value": "Mean: 136.5 px",
+            "color": "#FFFF00"
+          },
+          {
+            "start": [
+              704,
+              143.8108108108108
+            ],
+            "end": [
+              845.13765156574,
+              141.53439707587953
+            ],
+            "value": "Max: 141.2 px",
+            "color": "#FF4444"
+          }
+        ]
+      }
+    ],
+    "metrics": {
+      "tab_count": 2,
+      "pair_count": 1,
+      "overall_min_inner_dist_px": 127.33,
+      "overall_mean_inner_dist_px": 136.49,
+      "overall_max_inner_dist_px": 141.16,
+      "vertical_angle_thresh_deg": 60,
+      "inner_edge_half_angle_deg": 90,
+      "sample_spacing_px": 2
+    },
+    "ctq_results": [
+      {
+        "feature_id": 1,
+        "label": "tab_vert_inner_pair_001",
+        "category": "Tab",
+        "ann_id_a": 1,
+        "ann_id_b": 2,
+        "measurements": {
+          "min_inner_edge_dist_px": 127.33,
+          "mean_inner_edge_dist_px": 136.49,
+          "max_inner_edge_dist_px": 141.16,
+          "sample_count": 50
+        }
+      }
+    ],
+    "stdout": "Processed 2 'Tab' tabs → 1 pair(s) using near-vertical segments (±60.0° from vertical). Gap distances — min: 127.3 px, mean: 136.5 px, max: 141.2 px.\r\n"
+  },
+  "created_at": "2026-03-08T20:10:27.232Z",
+  "updated_at": "2026-03-08T20:10:27.232Z",
+  "source": {
+    "image_filename": "Damaged lithium-ion battery close-up.png",
+    "image_dimensions": {
+      "width": 1536,
+      "height": 1024
+    },
+    "categories": [
+      "Tab",
+      "Seal",
+      "Defect",
+      "Cathode"
+    ],
+    "annotation_count": 5
+  },
+  "tags": []
+}

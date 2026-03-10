@@ -1,0 +1,490 @@
+{
+  "id": "59ef3071-9dc9-4a99-8025-17442d6905cf",
+  "name": "Min distance from defect to current collector",
+  "description": "Measure the orthogonal minimum distance between each defect and the right current collector edge",
+  "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results in pixels.\n\ndef min_distance_between_contours(contour_a, contour_b):\n    \"\"\"Minimum distance between two contours in pixels.\"\"\"\n    min_dist_px = float('inf')\n    points_a = contour_a.reshape(-1, 2)\n    for pt in points_a:\n        dist = abs(cv2.pointPolygonTest(contour_b, tuple(map(float, pt)), True))\n        min_dist_px = min(min_dist_px, dist)\n    # Also check reverse direction\n    points_b = contour_b.reshape(-1, 2)\n    for pt in points_b:\n        dist = abs(cv2.pointPolygonTest(contour_a, tuple(map(float, pt)), True))\n        min_dist_px = min(min_dist_px, dist)\n    return min_dist_px\n\ndef closest_point_on_segment(p, a, b):\n    \"\"\"Project point p onto line segment a-b, return closest point.\"\"\"\n    ab = b - a\n    t = np.dot(p - a, ab) / (np.dot(ab, ab) + 1e-10)\n    t = max(0.0, min(1.0, t))\n    return a + t * ab\n\ndef find_closest_points(contour_a, contour_b):\n    \"\"\"Find the actual closest point pair between two contours (not just vertices).\"\"\"\n    min_dist = float('inf')\n    best_a, best_b = None, None\n    pts_a = contour_a.reshape(-1, 2).astype(np.float64)\n    pts_b = contour_b.reshape(-1, 2).astype(np.float64)\n    # Check each point of A against each edge of B\n    for pt in pts_a:\n        for j in range(len(pts_b)):\n            seg_start = pts_b[j]\n            seg_end = pts_b[(j + 1) % len(pts_b)]\n            proj = closest_point_on_segment(pt, seg_start, seg_end)\n            d = np.linalg.norm(pt - proj)\n            if d < min_dist:\n                min_dist = d\n                best_a, best_b = pt, proj\n    # Also check reverse: points of B against edges of A\n    for pt in pts_b:\n        for j in range(len(pts_a)):\n            seg_start = pts_a[j]\n            seg_end = pts_a[(j + 1) % len(pts_a)]\n            proj = closest_point_on_segment(pt, seg_start, seg_end)\n            d = np.linalg.norm(pt - proj)\n            if d < min_dist:\n                min_dist = d\n                best_a, best_b = proj, pt\n    return best_a, best_b\n\ndef measure_defect_to_edge_distance(defect_contour, edge_contour):\n    \"\"\"Measure minimum distance from defect to current collector edge.\"\"\"\n    distance_px = min_distance_between_contours(defect_contour, edge_contour)\n    return {\"distance_to_edge_px\": float(distance_px)}\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"Battery cathode defects in grayscale.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(ctq_results, edge_contour):\n    \"\"\"Create visual overlays showing distance measurements.\"\"\"\n    overlays = []\n    \n    # Add measurement lines\n    measurement_lines = []\n    \n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    for result in ctq_results:\n        if 'defect_contour' in result and 'distance_to_edge_px' in result['measurements']:\n            defect_contour = result['defect_contour']\n            distance = result['measurements']['distance_to_edge_px']\n            \n            # Find closest points for visualization\n            closest_defect, closest_edge = find_closest_points(defect_contour, edge_contour)\n            \n            if closest_defect is not None and closest_edge is not None:\n                measurement_lines.append({\n                    \"start\": [float(closest_defect[0]), float(closest_defect[1])],\n                    \"end\": [float(closest_edge[0]), float(closest_edge[1])],\n                    \"value\": f\"{distance:.1f} px\",\n                    \"color\": colors.get(result['category'], '#FFFFFF')\n                })\n    \n    if measurement_lines:\n        overlays.append({\n            \"type\": \"measurements\",\n            \"lines\": measurement_lines\n        })\n    \n    # Add contour overlays for defects\n    for result in ctq_results:\n        if 'defect_contour' in result:\n            contour_points = result['defect_contour'].reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(result['category'], '#FFFFFF'),\n                \"label\": result['label']\n            })\n    \n    # Add current collector edge contour\n    if edge_contour is not None:\n        edge_points = edge_contour.reshape(-1, 2).tolist()\n        overlays.append({\n            \"type\": \"contours\",\n            \"points\": edge_points,\n            \"color\": \"#808080\",  # Gray\n            \"label\": \"current_collector_edge\"\n        })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Find current collector edge annotation\n    edge_contour = None\n    for ann in coco[\"annotations\"]:\n        if cat_map[ann[\"category_id\"]] == \"current_collector_edge\":\n            if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n                seg = ann[\"segmentation\"][0]\n                edge_contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n                break\n    \n    if edge_contour is None:\n        # No current collector edge found\n        result = {\n            \"overlays\": [],\n            \"metrics\": {\"error\": \"No current_collector_edge annotation found\"},\n            \"ctq_results\": [],\n            \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f)\n        print(\"Error: No current collector edge found\")\n        return\n    \n    # Filter annotations to only defects\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    # Build CTQ results - measure distance for each defect\n    ctq_results = []\n    defect_counter = 1\n    total_distance = 0\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            defect_contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Measure distance to edge\n            measurements = measure_defect_to_edge_distance(defect_contour, edge_contour)\n            total_distance += measurements[\"distance_to_edge_px\"]\n            \n            ctq_results.append({\n                \"feature_id\": int(ann[\"id\"]),\n                \"label\": f\"{category_name}_{defect_counter:03d}\",\n                \"category\": category_name,\n                \"measurements\": measurements,\n                \"defect_contour\": defect_contour  # Store for overlay generation\n            })\n            defect_counter += 1\n    \n    # Calculate average distance\n    avg_distance = total_distance / len(ctq_results) if ctq_results else 0\n    \n    # Build overlays\n    overlays = build_overlays(ctq_results, edge_contour)\n    \n    # Clean up ctq_results (remove contour data before JSON serialization)\n    for result in ctq_results:\n        if 'defect_contour' in result:\n            del result['defect_contour']\n    \n    # Summary metrics\n    metrics = {\n        \"total_defects\": len(ctq_results),\n        \"avg_distance_to_edge_px\": float(avg_distance)\n    }\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Measured distances for {len(ctq_results)} defects to current collector edge\")\n\nmain()\n",
+  "prompt": "Measure the orthogonal minimum distance between each defect and the right current collector edge",
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "count the number of defects",
+      "timestamp": 1772390609436
+    },
+    {
+      "role": "assistant",
+      "content": "I'll count the number of defects by identifying all annotations that are defect categories (excluding structural elements like cathode_coating and current_collector_edge). I'll provide counts both overall and by defect type, with visual overlays showing each defect with a numbered label.",
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results.\n\ndef count_defects_by_category(annotations, cat_map):\n    \"\"\"Count defects by category, excluding non-defect categories.\"\"\"\n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    defect_counts = {}\n    total_defects = 0\n    \n    for ann in annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        if category_name in defect_categories:\n            defect_counts[category_name] = defect_counts.get(category_name, 0) + 1\n            total_defects += 1\n    \n    return total_defects, defect_counts\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"Battery cathode defects in grayscale.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(defect_annotations, cat_map):\n    \"\"\"Create visual overlays showing numbered defects.\"\"\"\n    overlays = []\n    \n    # Extract contours for defects\n    contour_data = []\n    text_entries = []\n    \n    defect_counter = 1\n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Add contour overlay\n            contour_points = contour.reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(category_name, '#FFFFFF'),\n                \"label\": f\"{category_name}_{defect_counter:03d}\"\n            })\n            \n            # Calculate centroid for text placement\n            moments = cv2.moments(contour)\n            if moments[\"m00\"] != 0:\n                cx = int(moments[\"m10\"] / moments[\"m00\"])\n                cy = int(moments[\"m01\"] / moments[\"m00\"])\n            else:\n                # Fallback to bbox center\n                bbox = ann[\"bbox\"]\n                cx = int(bbox[0] + bbox[2] / 2)\n                cy = int(bbox[1] + bbox[3] / 2)\n            \n            # Add numbered label\n            text_entries.append({\n                \"x\": int(cx),\n                \"y\": int(cy),\n                \"text\": str(defect_counter),\n                \"color\": \"#FFFFFF\",\n                \"size\": 16\n            })\n            \n            defect_counter += 1\n    \n    # Add text overlay\n    if text_entries:\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": text_entries\n        })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Filter annotations to only defects\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    # Count defects\n    total_defects, defect_counts = count_defects_by_category(coco[\"annotations\"], cat_map)\n    \n    # Build CTQ results - one entry per defect\n    ctq_results = []\n    defect_counter = 1\n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\": f\"{category_name}_{defect_counter:03d}\",\n            \"category\": category_name,\n            \"measurements\": {\n                \"count\": 1  # Each defect counts as 1\n            }\n        })\n        defect_counter += 1\n    \n    # Build overlays\n    overlays = build_overlays(defect_annotations, cat_map)\n    \n    # Summary metrics\n    metrics = {\n        \"total_defects\": int(total_defects)\n    }\n    \n    # Add individual defect type counts to metrics\n    for defect_type, count in defect_counts.items():\n        metrics[f\"{defect_type}_count\"] = int(count)\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Found {total_defects} total defects across {len(defect_counts)} categories\")\n\nmain()\n",
+      "timestamp": 1772390609436
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 4 features measured.",
+      "timestamp": 1772390609738
+    },
+    {
+      "role": "user",
+      "content": "Measure the orthogonal minimum distance between each defect and the right current collector edge",
+      "timestamp": 1772390868434
+    },
+    {
+      "role": "assistant",
+      "content": "I'll measure the orthogonal minimum distance from each defect to the right current collector edge. This involves finding the current collector edge annotation, then calculating the perpendicular distance from each defect contour to that edge using OpenCV's point-to-contour distance function.",
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results in pixels.\n\ndef min_distance_between_contours(contour_a, contour_b):\n    \"\"\"Minimum distance between two contours in pixels.\"\"\"\n    min_dist_px = float('inf')\n    points_a = contour_a.reshape(-1, 2)\n    for pt in points_a:\n        dist = abs(cv2.pointPolygonTest(contour_b, tuple(map(float, pt)), True))\n        min_dist_px = min(min_dist_px, dist)\n    # Also check reverse direction\n    points_b = contour_b.reshape(-1, 2)\n    for pt in points_b:\n        dist = abs(cv2.pointPolygonTest(contour_a, tuple(map(float, pt)), True))\n        min_dist_px = min(min_dist_px, dist)\n    return min_dist_px\n\ndef closest_point_on_segment(p, a, b):\n    \"\"\"Project point p onto line segment a-b, return closest point.\"\"\"\n    ab = b - a\n    t = np.dot(p - a, ab) / (np.dot(ab, ab) + 1e-10)\n    t = max(0.0, min(1.0, t))\n    return a + t * ab\n\ndef find_closest_points(contour_a, contour_b):\n    \"\"\"Find the actual closest point pair between two contours (not just vertices).\"\"\"\n    min_dist = float('inf')\n    best_a, best_b = None, None\n    pts_a = contour_a.reshape(-1, 2).astype(np.float64)\n    pts_b = contour_b.reshape(-1, 2).astype(np.float64)\n    # Check each point of A against each edge of B\n    for pt in pts_a:\n        for j in range(len(pts_b)):\n            seg_start = pts_b[j]\n            seg_end = pts_b[(j + 1) % len(pts_b)]\n            proj = closest_point_on_segment(pt, seg_start, seg_end)\n            d = np.linalg.norm(pt - proj)\n            if d < min_dist:\n                min_dist = d\n                best_a, best_b = pt, proj\n    # Also check reverse: points of B against edges of A\n    for pt in pts_b:\n        for j in range(len(pts_a)):\n            seg_start = pts_a[j]\n            seg_end = pts_a[(j + 1) % len(pts_a)]\n            proj = closest_point_on_segment(pt, seg_start, seg_end)\n            d = np.linalg.norm(pt - proj)\n            if d < min_dist:\n                min_dist = d\n                best_a, best_b = proj, pt\n    return best_a, best_b\n\ndef measure_defect_to_edge_distance(defect_contour, edge_contour):\n    \"\"\"Measure minimum distance from defect to current collector edge.\"\"\"\n    distance_px = min_distance_between_contours(defect_contour, edge_contour)\n    return {\"distance_to_edge_px\": float(distance_px)}\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"Battery cathode defects in grayscale.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(ctq_results, edge_contour):\n    \"\"\"Create visual overlays showing distance measurements.\"\"\"\n    overlays = []\n    \n    # Add measurement lines\n    measurement_lines = []\n    \n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    for result in ctq_results:\n        if 'defect_contour' in result and 'distance_to_edge_px' in result['measurements']:\n            defect_contour = result['defect_contour']\n            distance = result['measurements']['distance_to_edge_px']\n            \n            # Find closest points for visualization\n            closest_defect, closest_edge = find_closest_points(defect_contour, edge_contour)\n            \n            if closest_defect is not None and closest_edge is not None:\n                measurement_lines.append({\n                    \"start\": [float(closest_defect[0]), float(closest_defect[1])],\n                    \"end\": [float(closest_edge[0]), float(closest_edge[1])],\n                    \"value\": f\"{distance:.1f} px\",\n                    \"color\": colors.get(result['category'], '#FFFFFF')\n                })\n    \n    if measurement_lines:\n        overlays.append({\n            \"type\": \"measurements\",\n            \"lines\": measurement_lines\n        })\n    \n    # Add contour overlays for defects\n    for result in ctq_results:\n        if 'defect_contour' in result:\n            contour_points = result['defect_contour'].reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(result['category'], '#FFFFFF'),\n                \"label\": result['label']\n            })\n    \n    # Add current collector edge contour\n    if edge_contour is not None:\n        edge_points = edge_contour.reshape(-1, 2).tolist()\n        overlays.append({\n            \"type\": \"contours\",\n            \"points\": edge_points,\n            \"color\": \"#808080\",  # Gray\n            \"label\": \"current_collector_edge\"\n        })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Find current collector edge annotation\n    edge_contour = None\n    for ann in coco[\"annotations\"]:\n        if cat_map[ann[\"category_id\"]] == \"current_collector_edge\":\n            if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n                seg = ann[\"segmentation\"][0]\n                edge_contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n                break\n    \n    if edge_contour is None:\n        # No current collector edge found\n        result = {\n            \"overlays\": [],\n            \"metrics\": {\"error\": \"No current_collector_edge annotation found\"},\n            \"ctq_results\": [],\n            \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f)\n        print(\"Error: No current collector edge found\")\n        return\n    \n    # Filter annotations to only defects\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    # Build CTQ results - measure distance for each defect\n    ctq_results = []\n    defect_counter = 1\n    total_distance = 0\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            defect_contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Measure distance to edge\n            measurements = measure_defect_to_edge_distance(defect_contour, edge_contour)\n            total_distance += measurements[\"distance_to_edge_px\"]\n            \n            ctq_results.append({\n                \"feature_id\": int(ann[\"id\"]),\n                \"label\": f\"{category_name}_{defect_counter:03d}\",\n                \"category\": category_name,\n                \"measurements\": measurements,\n                \"defect_contour\": defect_contour  # Store for overlay generation\n            })\n            defect_counter += 1\n    \n    # Calculate average distance\n    avg_distance = total_distance / len(ctq_results) if ctq_results else 0\n    \n    # Build overlays\n    overlays = build_overlays(ctq_results, edge_contour)\n    \n    # Clean up ctq_results (remove contour data before JSON serialization)\n    for result in ctq_results:\n        if 'defect_contour' in result:\n            del result['defect_contour']\n    \n    # Summary metrics\n    metrics = {\n        \"total_defects\": len(ctq_results),\n        \"avg_distance_to_edge_px\": float(avg_distance)\n    }\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Measured distances for {len(ctq_results)} defects to current collector edge\")\n\nmain()\n",
+      "timestamp": 1772390868434
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.2s. 4 features measured.",
+      "timestamp": 1772390868689
+    }
+  ],
+  "last_result": {
+    "overlays": [
+      {
+        "type": "measurements",
+        "lines": [
+          {
+            "start": [
+              401,
+              227
+            ],
+            "end": [
+              257,
+              226.99999999999997
+            ],
+            "value": "144.0 px",
+            "color": "#FF0000"
+          },
+          {
+            "start": [
+              924,
+              171
+            ],
+            "end": [
+              257,
+              171
+            ],
+            "value": "667.0 px",
+            "color": "#00FF00"
+          },
+          {
+            "start": [
+              323,
+              678
+            ],
+            "end": [
+              257,
+              678
+            ],
+            "value": "66.0 px",
+            "color": "#0000FF"
+          },
+          {
+            "start": [
+              829,
+              692
+            ],
+            "end": [
+              257,
+              692
+            ],
+            "value": "572.0 px",
+            "color": "#FFFF00"
+          }
+        ]
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            402,
+            214
+          ],
+          [
+            409,
+            210
+          ],
+          [
+            418,
+            209
+          ],
+          [
+            429,
+            213
+          ],
+          [
+            436,
+            221
+          ],
+          [
+            434,
+            230
+          ],
+          [
+            425,
+            237
+          ],
+          [
+            414,
+            239
+          ],
+          [
+            406,
+            235
+          ],
+          [
+            401,
+            227
+          ]
+        ],
+        "color": "#FF0000",
+        "label": "particle_defect_001"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            926,
+            157
+          ],
+          [
+            941,
+            153
+          ],
+          [
+            958,
+            151
+          ],
+          [
+            974,
+            153
+          ],
+          [
+            989,
+            159
+          ],
+          [
+            1007,
+            169
+          ],
+          [
+            1025,
+            179
+          ],
+          [
+            1047,
+            194
+          ],
+          [
+            1060,
+            203
+          ],
+          [
+            1068,
+            212
+          ],
+          [
+            1073,
+            220
+          ],
+          [
+            1076,
+            231
+          ],
+          [
+            1073,
+            240
+          ],
+          [
+            1066,
+            247
+          ],
+          [
+            1057,
+            250
+          ],
+          [
+            1045,
+            246
+          ],
+          [
+            1027,
+            236
+          ],
+          [
+            1013,
+            227
+          ],
+          [
+            999,
+            218
+          ],
+          [
+            982,
+            208
+          ],
+          [
+            965,
+            199
+          ],
+          [
+            948,
+            190
+          ],
+          [
+            934,
+            181
+          ],
+          [
+            924,
+            171
+          ]
+        ],
+        "color": "#00FF00",
+        "label": "scratch_defect_002"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            331,
+            597
+          ],
+          [
+            346,
+            588
+          ],
+          [
+            365,
+            585
+          ],
+          [
+            386,
+            589
+          ],
+          [
+            408,
+            601
+          ],
+          [
+            423,
+            616
+          ],
+          [
+            432,
+            636
+          ],
+          [
+            437,
+            658
+          ],
+          [
+            436,
+            681
+          ],
+          [
+            428,
+            701
+          ],
+          [
+            411,
+            717
+          ],
+          [
+            392,
+            726
+          ],
+          [
+            371,
+            728
+          ],
+          [
+            352,
+            723
+          ],
+          [
+            338,
+            712
+          ],
+          [
+            328,
+            698
+          ],
+          [
+            323,
+            678
+          ],
+          [
+            323,
+            659
+          ]
+        ],
+        "color": "#0000FF",
+        "label": "delamination_defect_003"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            846,
+            609
+          ],
+          [
+            869,
+            600
+          ],
+          [
+            895,
+            598
+          ],
+          [
+            916,
+            603
+          ],
+          [
+            933,
+            615
+          ],
+          [
+            947,
+            631
+          ],
+          [
+            958,
+            653
+          ],
+          [
+            963,
+            677
+          ],
+          [
+            960,
+            700
+          ],
+          [
+            949,
+            722
+          ],
+          [
+            931,
+            740
+          ],
+          [
+            910,
+            751
+          ],
+          [
+            887,
+            753
+          ],
+          [
+            864,
+            746
+          ],
+          [
+            846,
+            732
+          ],
+          [
+            835,
+            713
+          ],
+          [
+            829,
+            692
+          ],
+          [
+            830,
+            669
+          ]
+        ],
+        "color": "#FFFF00",
+        "label": "coating_defect_004"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            197,
+            0
+          ],
+          [
+            257,
+            0
+          ],
+          [
+            257,
+            1023
+          ],
+          [
+            197,
+            1023
+          ]
+        ],
+        "color": "#808080",
+        "label": "current_collector_edge"
+      }
+    ],
+    "metrics": {
+      "total_defects": 4,
+      "avg_distance_to_edge_px": 362.25
+    },
+    "ctq_results": [
+      {
+        "feature_id": 1,
+        "label": "particle_defect_001",
+        "category": "particle_defect",
+        "measurements": {
+          "distance_to_edge_px": 144
+        }
+      },
+      {
+        "feature_id": 2,
+        "label": "scratch_defect_002",
+        "category": "scratch_defect",
+        "measurements": {
+          "distance_to_edge_px": 667
+        }
+      },
+      {
+        "feature_id": 3,
+        "label": "delamination_defect_003",
+        "category": "delamination_defect",
+        "measurements": {
+          "distance_to_edge_px": 66
+        }
+      },
+      {
+        "feature_id": 4,
+        "label": "coating_defect_004",
+        "category": "coating_defect",
+        "measurements": {
+          "distance_to_edge_px": 572
+        }
+      }
+    ],
+    "stdout": "Measured distances for 4 defects to current collector edge\r\n"
+  },
+  "created_at": "2026-03-01T18:48:24.158Z",
+  "updated_at": "2026-03-01T18:48:24.158Z",
+  "source": {
+    "image_filename": "Battery cathode defects in grayscale.png",
+    "image_dimensions": {
+      "width": 1536,
+      "height": 1024
+    },
+    "categories": [
+      "particle_defect",
+      "scratch_defect",
+      "delamination_defect",
+      "coating_defect",
+      "current_collector_edge",
+      "cathode_coating"
+    ],
+    "annotation_count": 6
+  },
+  "tags": [
+    "defects",
+    "measurement"
+  ]
+}

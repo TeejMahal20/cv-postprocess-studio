@@ -1,0 +1,829 @@
+{
+  "id": "9c1e71ff-55c9-47cf-8910-049f4395ea5e",
+  "name": "Defect are ratio to coating",
+  "description": "",
+  "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results in pixels.\n\ndef measure_defect_area_ratio(defect_contour, cathode_coating_area):\n    \"\"\"Measure a single defect's area ratio and percentage relative to cathode coating.\"\"\"\n    defect_area = cv2.contourArea(defect_contour)\n    area_ratio = defect_area / cathode_coating_area if cathode_coating_area > 0 else 0.0\n    area_percentage = area_ratio * 100.0\n    \n    return {\n        \"area_px\": defect_area,\n        \"area_ratio\": area_ratio,\n        \"area_percentage\": area_percentage\n    }\n\ndef calculate_total_cathode_area(cathode_annotations):\n    \"\"\"Calculate total area of all cathode coating annotations.\"\"\"\n    total_area = 0.0\n    for ann in cathode_annotations:\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            total_area += cv2.contourArea(contour)\n    return total_area\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"ChatGPT Image Mar 1, 2026, 12_30_06 PM.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(ctq_results, defect_annotations, cat_map):\n    \"\"\"Create visual overlays showing defects with area percentage labels.\"\"\"\n    overlays = []\n    \n    contour_data = []\n    text_entries = []\n    \n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    for i, ann in enumerate(defect_annotations):\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Add contour overlay\n            contour_points = contour.reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(category_name, '#FFFFFF'),\n                \"label\": ctq_results[i][\"label\"]\n            })\n            \n            # Calculate centroid for text placement\n            moments = cv2.moments(contour)\n            if moments[\"m00\"] != 0:\n                cx = int(moments[\"m10\"] / moments[\"m00\"])\n                cy = int(moments[\"m01\"] / moments[\"m00\"])\n            else:\n                # Fallback to bbox center\n                bbox = ann[\"bbox\"]\n                cx = int(bbox[0] + bbox[2] / 2)\n                cy = int(bbox[1] + bbox[3] / 2)\n            \n            # Add area percentage label\n            area_percentage = ctq_results[i][\"measurements\"][\"area_percentage\"]\n            text_entries.append({\n                \"x\": int(cx),\n                \"y\": int(cy),\n                \"text\": f\"{area_percentage:.4f}%\",\n                \"color\": \"#FFFFFF\",\n                \"size\": 14\n            })\n    \n    # Add text overlay\n    if text_entries:\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": text_entries\n        })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Filter annotations\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    cathode_annotations = [ann for ann in coco[\"annotations\"]\n                          if cat_map[ann[\"category_id\"]] == 'cathode_coating']\n    \n    # Calculate total cathode coating area\n    total_cathode_area = calculate_total_cathode_area(cathode_annotations)\n    \n    # Measure each defect\n    ctq_results = []\n    defect_counter = 1\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Measure area ratio and percentage\n            measurements = measure_defect_area_ratio(contour, total_cathode_area)\n            \n            ctq_results.append({\n                \"feature_id\": int(ann[\"id\"]),\n                \"label\": f\"{category_name}_{defect_counter:03d}\",\n                \"category\": category_name,\n                \"measurements\": {\n                    \"area_px\": float(measurements[\"area_px\"]),\n                    \"area_ratio\": float(measurements[\"area_ratio\"]),\n                    \"area_percentage\": float(measurements[\"area_percentage\"])\n                }\n            })\n            \n            defect_counter += 1\n    \n    # Build overlays\n    overlays = build_overlays(ctq_results, defect_annotations, cat_map)\n    \n    # Summary metrics\n    total_defect_area = sum(result[\"measurements\"][\"area_px\"] for result in ctq_results)\n    avg_area_ratio = sum(result[\"measurements\"][\"area_ratio\"] for result in ctq_results) / len(ctq_results) if ctq_results else 0.0\n    avg_area_percentage = avg_area_ratio * 100.0\n    total_defect_percentage = (total_defect_area / total_cathode_area * 100.0) if total_cathode_area > 0 else 0.0\n    \n    metrics = {\n        \"total_defects\": int(len(ctq_results)),\n        \"total_cathode_area_px\": float(total_cathode_area),\n        \"total_defect_area_px\": float(total_defect_area),\n        \"avg_area_ratio\": float(avg_area_ratio),\n        \"avg_area_percentage\": float(avg_area_percentage),\n        \"total_defect_to_cathode_ratio\": float(total_defect_area / total_cathode_area) if total_cathode_area > 0 else 0.0,\n        \"total_defect_to_cathode_percentage\": float(total_defect_percentage)\n    }\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Measured {len(ctq_results)} defects with area ratios and percentages relative to {total_cathode_area:.1f} px² cathode coating\")\n\nmain()\n",
+  "prompt": "Also add percentage instead of just ratio",
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "count the number of defects",
+      "timestamp": 1772390609436
+    },
+    {
+      "role": "assistant",
+      "content": "I'll count the number of defects by identifying all annotations that are defect categories (excluding structural elements like cathode_coating and current_collector_edge). I'll provide counts both overall and by defect type, with visual overlays showing each defect with a numbered label.",
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results.\n\ndef count_defects_by_category(annotations, cat_map):\n    \"\"\"Count defects by category, excluding non-defect categories.\"\"\"\n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    defect_counts = {}\n    total_defects = 0\n    \n    for ann in annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        if category_name in defect_categories:\n            defect_counts[category_name] = defect_counts.get(category_name, 0) + 1\n            total_defects += 1\n    \n    return total_defects, defect_counts\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"Battery cathode defects in grayscale.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(defect_annotations, cat_map):\n    \"\"\"Create visual overlays showing numbered defects.\"\"\"\n    overlays = []\n    \n    # Extract contours for defects\n    contour_data = []\n    text_entries = []\n    \n    defect_counter = 1\n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Add contour overlay\n            contour_points = contour.reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(category_name, '#FFFFFF'),\n                \"label\": f\"{category_name}_{defect_counter:03d}\"\n            })\n            \n            # Calculate centroid for text placement\n            moments = cv2.moments(contour)\n            if moments[\"m00\"] != 0:\n                cx = int(moments[\"m10\"] / moments[\"m00\"])\n                cy = int(moments[\"m01\"] / moments[\"m00\"])\n            else:\n                # Fallback to bbox center\n                bbox = ann[\"bbox\"]\n                cx = int(bbox[0] + bbox[2] / 2)\n                cy = int(bbox[1] + bbox[3] / 2)\n            \n            # Add numbered label\n            text_entries.append({\n                \"x\": int(cx),\n                \"y\": int(cy),\n                \"text\": str(defect_counter),\n                \"color\": \"#FFFFFF\",\n                \"size\": 16\n            })\n            \n            defect_counter += 1\n    \n    # Add text overlay\n    if text_entries:\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": text_entries\n        })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Filter annotations to only defects\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    # Count defects\n    total_defects, defect_counts = count_defects_by_category(coco[\"annotations\"], cat_map)\n    \n    # Build CTQ results - one entry per defect\n    ctq_results = []\n    defect_counter = 1\n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\": f\"{category_name}_{defect_counter:03d}\",\n            \"category\": category_name,\n            \"measurements\": {\n                \"count\": 1  # Each defect counts as 1\n            }\n        })\n        defect_counter += 1\n    \n    # Build overlays\n    overlays = build_overlays(defect_annotations, cat_map)\n    \n    # Summary metrics\n    metrics = {\n        \"total_defects\": int(total_defects)\n    }\n    \n    # Add individual defect type counts to metrics\n    for defect_type, count in defect_counts.items():\n        metrics[f\"{defect_type}_count\"] = int(count)\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Found {total_defects} total defects across {len(defect_counts)} categories\")\n\nmain()\n",
+      "timestamp": 1772390609436
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 4 features measured.",
+      "timestamp": 1772390609738
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.2s. 4 features measured.",
+      "timestamp": 1772393306367
+    },
+    {
+      "role": "user",
+      "content": "Measure each defects area relative to the cathode coatings area. Report as a ratio",
+      "timestamp": 1772393358046
+    },
+    {
+      "role": "assistant",
+      "content": "I'll measure each defect's area as a ratio relative to the cathode coating area. This approach finds all defects and the cathode coating, calculates their precise polygon areas using OpenCV, then computes the ratio for each defect.",
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results in pixels.\n\ndef measure_defect_area_ratio(defect_contour, cathode_coating_area):\n    \"\"\"Measure a single defect's area ratio relative to cathode coating.\"\"\"\n    defect_area = cv2.contourArea(defect_contour)\n    area_ratio = defect_area / cathode_coating_area if cathode_coating_area > 0 else 0.0\n    \n    return {\n        \"area_px\": defect_area,\n        \"area_ratio\": area_ratio\n    }\n\ndef calculate_total_cathode_area(cathode_annotations):\n    \"\"\"Calculate total area of all cathode coating annotations.\"\"\"\n    total_area = 0.0\n    for ann in cathode_annotations:\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            total_area += cv2.contourArea(contour)\n    return total_area\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"ChatGPT Image Mar 1, 2026, 12_30_06 PM.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(ctq_results, defect_annotations, cat_map):\n    \"\"\"Create visual overlays showing defects with area ratio labels.\"\"\"\n    overlays = []\n    \n    contour_data = []\n    text_entries = []\n    \n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    for i, ann in enumerate(defect_annotations):\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Add contour overlay\n            contour_points = contour.reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(category_name, '#FFFFFF'),\n                \"label\": ctq_results[i][\"label\"]\n            })\n            \n            # Calculate centroid for text placement\n            moments = cv2.moments(contour)\n            if moments[\"m00\"] != 0:\n                cx = int(moments[\"m10\"] / moments[\"m00\"])\n                cy = int(moments[\"m01\"] / moments[\"m00\"])\n            else:\n                # Fallback to bbox center\n                bbox = ann[\"bbox\"]\n                cx = int(bbox[0] + bbox[2] / 2)\n                cy = int(bbox[1] + bbox[3] / 2)\n            \n            # Add area ratio label\n            area_ratio = ctq_results[i][\"measurements\"][\"area_ratio\"]\n            text_entries.append({\n                \"x\": int(cx),\n                \"y\": int(cy),\n                \"text\": f\"{area_ratio:.4f}\",\n                \"color\": \"#FFFFFF\",\n                \"size\": 14\n            })\n    \n    # Add text overlay\n    if text_entries:\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": text_entries\n        })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Filter annotations\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    cathode_annotations = [ann for ann in coco[\"annotations\"]\n                          if cat_map[ann[\"category_id\"]] == 'cathode_coating']\n    \n    # Calculate total cathode coating area\n    total_cathode_area = calculate_total_cathode_area(cathode_annotations)\n    \n    # Measure each defect\n    ctq_results = []\n    defect_counter = 1\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Measure area ratio\n            measurements = measure_defect_area_ratio(contour, total_cathode_area)\n            \n            ctq_results.append({\n                \"feature_id\": int(ann[\"id\"]),\n                \"label\": f\"{category_name}_{defect_counter:03d}\",\n                \"category\": category_name,\n                \"measurements\": {\n                    \"area_px\": float(measurements[\"area_px\"]),\n                    \"area_ratio\": float(measurements[\"area_ratio\"])\n                }\n            })\n            \n            defect_counter += 1\n    \n    # Build overlays\n    overlays = build_overlays(ctq_results, defect_annotations, cat_map)\n    \n    # Summary metrics\n    total_defect_area = sum(result[\"measurements\"][\"area_px\"] for result in ctq_results)\n    avg_area_ratio = sum(result[\"measurements\"][\"area_ratio\"] for result in ctq_results) / len(ctq_results) if ctq_results else 0.0\n    \n    metrics = {\n        \"total_defects\": int(len(ctq_results)),\n        \"total_cathode_area_px\": float(total_cathode_area),\n        \"total_defect_area_px\": float(total_defect_area),\n        \"avg_area_ratio\": float(avg_area_ratio),\n        \"total_defect_to_cathode_ratio\": float(total_defect_area / total_cathode_area) if total_cathode_area > 0 else 0.0\n    }\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Measured {len(ctq_results)} defects with area ratios relative to {total_cathode_area:.1f} px² cathode coating\")\n\nmain()\n",
+      "timestamp": 1772393358046
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 4 features measured.",
+      "timestamp": 1772393358310
+    },
+    {
+      "role": "user",
+      "content": "Also add percentage instead of just ratio",
+      "timestamp": 1772393399399
+    },
+    {
+      "role": "assistant",
+      "content": "I'll modify the code to include percentage values alongside the existing ratios. This will make the results more intuitive by showing both the decimal ratio (0.0001) and the percentage (0.01%).",
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results in pixels.\n\ndef measure_defect_area_ratio(defect_contour, cathode_coating_area):\n    \"\"\"Measure a single defect's area ratio and percentage relative to cathode coating.\"\"\"\n    defect_area = cv2.contourArea(defect_contour)\n    area_ratio = defect_area / cathode_coating_area if cathode_coating_area > 0 else 0.0\n    area_percentage = area_ratio * 100.0\n    \n    return {\n        \"area_px\": defect_area,\n        \"area_ratio\": area_ratio,\n        \"area_percentage\": area_percentage\n    }\n\ndef calculate_total_cathode_area(cathode_annotations):\n    \"\"\"Calculate total area of all cathode coating annotations.\"\"\"\n    total_area = 0.0\n    for ann in cathode_annotations:\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            total_area += cv2.contourArea(contour)\n    return total_area\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"ChatGPT Image Mar 1, 2026, 12_30_06 PM.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(ctq_results, defect_annotations, cat_map):\n    \"\"\"Create visual overlays showing defects with area percentage labels.\"\"\"\n    overlays = []\n    \n    contour_data = []\n    text_entries = []\n    \n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    for i, ann in enumerate(defect_annotations):\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Add contour overlay\n            contour_points = contour.reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(category_name, '#FFFFFF'),\n                \"label\": ctq_results[i][\"label\"]\n            })\n            \n            # Calculate centroid for text placement\n            moments = cv2.moments(contour)\n            if moments[\"m00\"] != 0:\n                cx = int(moments[\"m10\"] / moments[\"m00\"])\n                cy = int(moments[\"m01\"] / moments[\"m00\"])\n            else:\n                # Fallback to bbox center\n                bbox = ann[\"bbox\"]\n                cx = int(bbox[0] + bbox[2] / 2)\n                cy = int(bbox[1] + bbox[3] / 2)\n            \n            # Add area percentage label\n            area_percentage = ctq_results[i][\"measurements\"][\"area_percentage\"]\n            text_entries.append({\n                \"x\": int(cx),\n                \"y\": int(cy),\n                \"text\": f\"{area_percentage:.4f}%\",\n                \"color\": \"#FFFFFF\",\n                \"size\": 14\n            })\n    \n    # Add text overlay\n    if text_entries:\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": text_entries\n        })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Filter annotations\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    cathode_annotations = [ann for ann in coco[\"annotations\"]\n                          if cat_map[ann[\"category_id\"]] == 'cathode_coating']\n    \n    # Calculate total cathode coating area\n    total_cathode_area = calculate_total_cathode_area(cathode_annotations)\n    \n    # Measure each defect\n    ctq_results = []\n    defect_counter = 1\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Measure area ratio and percentage\n            measurements = measure_defect_area_ratio(contour, total_cathode_area)\n            \n            ctq_results.append({\n                \"feature_id\": int(ann[\"id\"]),\n                \"label\": f\"{category_name}_{defect_counter:03d}\",\n                \"category\": category_name,\n                \"measurements\": {\n                    \"area_px\": float(measurements[\"area_px\"]),\n                    \"area_ratio\": float(measurements[\"area_ratio\"]),\n                    \"area_percentage\": float(measurements[\"area_percentage\"])\n                }\n            })\n            \n            defect_counter += 1\n    \n    # Build overlays\n    overlays = build_overlays(ctq_results, defect_annotations, cat_map)\n    \n    # Summary metrics\n    total_defect_area = sum(result[\"measurements\"][\"area_px\"] for result in ctq_results)\n    avg_area_ratio = sum(result[\"measurements\"][\"area_ratio\"] for result in ctq_results) / len(ctq_results) if ctq_results else 0.0\n    avg_area_percentage = avg_area_ratio * 100.0\n    total_defect_percentage = (total_defect_area / total_cathode_area * 100.0) if total_cathode_area > 0 else 0.0\n    \n    metrics = {\n        \"total_defects\": int(len(ctq_results)),\n        \"total_cathode_area_px\": float(total_cathode_area),\n        \"total_defect_area_px\": float(total_defect_area),\n        \"avg_area_ratio\": float(avg_area_ratio),\n        \"avg_area_percentage\": float(avg_area_percentage),\n        \"total_defect_to_cathode_ratio\": float(total_defect_area / total_cathode_area) if total_cathode_area > 0 else 0.0,\n        \"total_defect_to_cathode_percentage\": float(total_defect_percentage)\n    }\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Measured {len(ctq_results)} defects with area ratios and percentages relative to {total_cathode_area:.1f} px² cathode coating\")\n\nmain()\n",
+      "timestamp": 1772393399399
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 4 features measured.",
+      "timestamp": 1772393399676
+    }
+  ],
+  "last_result": {
+    "overlays": [
+      {
+        "type": "contours",
+        "points": [
+          [
+            392,
+            156
+          ],
+          [
+            393,
+            162
+          ],
+          [
+            397,
+            166
+          ],
+          [
+            402,
+            167
+          ],
+          [
+            417,
+            164
+          ],
+          [
+            424,
+            158
+          ],
+          [
+            422,
+            152
+          ],
+          [
+            413,
+            146
+          ],
+          [
+            397,
+            147
+          ]
+        ],
+        "color": "#FF0000",
+        "label": "particle_defect_001"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            573,
+            597
+          ],
+          [
+            558,
+            579
+          ],
+          [
+            552,
+            576
+          ],
+          [
+            541,
+            564
+          ],
+          [
+            529,
+            558
+          ],
+          [
+            523,
+            550
+          ],
+          [
+            508,
+            544
+          ],
+          [
+            488,
+            543
+          ],
+          [
+            477,
+            546
+          ],
+          [
+            428,
+            548
+          ],
+          [
+            404,
+            553
+          ],
+          [
+            386,
+            560
+          ],
+          [
+            330,
+            567
+          ],
+          [
+            324,
+            573
+          ],
+          [
+            323,
+            586
+          ],
+          [
+            317,
+            590
+          ],
+          [
+            311,
+            603
+          ],
+          [
+            316,
+            613
+          ],
+          [
+            324,
+            620
+          ],
+          [
+            324,
+            625
+          ],
+          [
+            331,
+            632
+          ],
+          [
+            354,
+            641
+          ],
+          [
+            376,
+            653
+          ],
+          [
+            403,
+            658
+          ],
+          [
+            408,
+            663
+          ],
+          [
+            407,
+            667
+          ],
+          [
+            423,
+            667
+          ],
+          [
+            454,
+            662
+          ],
+          [
+            484,
+            653
+          ],
+          [
+            501,
+            654
+          ],
+          [
+            515,
+            651
+          ],
+          [
+            524,
+            641
+          ],
+          [
+            561,
+            625
+          ],
+          [
+            573,
+            603
+          ]
+        ],
+        "color": "#0000FF",
+        "label": "delamination_defect_002"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            849,
+            143
+          ],
+          [
+            851,
+            148
+          ],
+          [
+            860,
+            153
+          ],
+          [
+            882,
+            160
+          ],
+          [
+            904,
+            161
+          ],
+          [
+            920,
+            165
+          ],
+          [
+            946,
+            179
+          ],
+          [
+            1004,
+            194
+          ],
+          [
+            1028,
+            204
+          ],
+          [
+            1032,
+            208
+          ],
+          [
+            1037,
+            208
+          ],
+          [
+            1053,
+            215
+          ],
+          [
+            1058,
+            214
+          ],
+          [
+            1074,
+            224
+          ],
+          [
+            1085,
+            224
+          ],
+          [
+            1095,
+            230
+          ],
+          [
+            1101,
+            229
+          ],
+          [
+            1115,
+            234
+          ],
+          [
+            1116,
+            237
+          ],
+          [
+            1124,
+            236
+          ],
+          [
+            1145,
+            240
+          ],
+          [
+            1154,
+            246
+          ],
+          [
+            1172,
+            246
+          ],
+          [
+            1175,
+            249
+          ],
+          [
+            1188,
+            250
+          ],
+          [
+            1189,
+            243
+          ],
+          [
+            1182,
+            241
+          ],
+          [
+            1178,
+            237
+          ],
+          [
+            1178,
+            231
+          ],
+          [
+            1169,
+            225
+          ],
+          [
+            1159,
+            222
+          ],
+          [
+            1155,
+            218
+          ],
+          [
+            1149,
+            220
+          ],
+          [
+            1083,
+            200
+          ],
+          [
+            1059,
+            190
+          ],
+          [
+            1054,
+            191
+          ],
+          [
+            1024,
+            179
+          ],
+          [
+            995,
+            175
+          ],
+          [
+            964,
+            162
+          ],
+          [
+            958,
+            162
+          ],
+          [
+            927,
+            152
+          ],
+          [
+            903,
+            148
+          ],
+          [
+            884,
+            141
+          ],
+          [
+            852,
+            141
+          ]
+        ],
+        "color": "#00FF00",
+        "label": "scratch_defect_003"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            1071,
+            474
+          ],
+          [
+            1067,
+            481
+          ],
+          [
+            1070,
+            486
+          ],
+          [
+            1063,
+            492
+          ],
+          [
+            1058,
+            502
+          ],
+          [
+            1059,
+            509
+          ],
+          [
+            1050,
+            519
+          ],
+          [
+            1042,
+            521
+          ],
+          [
+            1041,
+            531
+          ],
+          [
+            1032,
+            543
+          ],
+          [
+            1030,
+            551
+          ],
+          [
+            1032,
+            557
+          ],
+          [
+            1019,
+            571
+          ],
+          [
+            1017,
+            592
+          ],
+          [
+            1021,
+            601
+          ],
+          [
+            1030,
+            607
+          ],
+          [
+            1038,
+            619
+          ],
+          [
+            1041,
+            628
+          ],
+          [
+            1049,
+            635
+          ],
+          [
+            1049,
+            638
+          ],
+          [
+            1057,
+            643
+          ],
+          [
+            1074,
+            660
+          ],
+          [
+            1082,
+            663
+          ],
+          [
+            1098,
+            676
+          ],
+          [
+            1117,
+            685
+          ],
+          [
+            1135,
+            685
+          ],
+          [
+            1151,
+            690
+          ],
+          [
+            1184,
+            692
+          ],
+          [
+            1209,
+            687
+          ],
+          [
+            1226,
+            688
+          ],
+          [
+            1230,
+            685
+          ],
+          [
+            1236,
+            686
+          ],
+          [
+            1238,
+            685
+          ],
+          [
+            1238,
+            681
+          ],
+          [
+            1251,
+            676
+          ],
+          [
+            1268,
+            676
+          ],
+          [
+            1277,
+            672
+          ],
+          [
+            1295,
+            650
+          ],
+          [
+            1300,
+            646
+          ],
+          [
+            1304,
+            646
+          ],
+          [
+            1303,
+            642
+          ],
+          [
+            1305,
+            637
+          ],
+          [
+            1303,
+            635
+          ],
+          [
+            1309,
+            632
+          ],
+          [
+            1311,
+            628
+          ],
+          [
+            1310,
+            621
+          ],
+          [
+            1313,
+            617
+          ],
+          [
+            1312,
+            605
+          ],
+          [
+            1314,
+            603
+          ],
+          [
+            1315,
+            590
+          ],
+          [
+            1310,
+            580
+          ],
+          [
+            1294,
+            571
+          ],
+          [
+            1285,
+            559
+          ],
+          [
+            1280,
+            556
+          ],
+          [
+            1271,
+            533
+          ],
+          [
+            1243,
+            528
+          ],
+          [
+            1241,
+            524
+          ],
+          [
+            1231,
+            517
+          ],
+          [
+            1223,
+            515
+          ],
+          [
+            1206,
+            501
+          ],
+          [
+            1203,
+            493
+          ],
+          [
+            1193,
+            485
+          ],
+          [
+            1194,
+            481
+          ],
+          [
+            1176,
+            472
+          ],
+          [
+            1170,
+            467
+          ],
+          [
+            1155,
+            464
+          ],
+          [
+            1148,
+            460
+          ],
+          [
+            1127,
+            459
+          ],
+          [
+            1104,
+            462
+          ],
+          [
+            1085,
+            467
+          ]
+        ],
+        "color": "#FFFF00",
+        "label": "coating_defect_004"
+      },
+      {
+        "type": "text",
+        "entries": [
+          {
+            "x": 407,
+            "y": 156,
+            "text": "0.0389%",
+            "color": "#FFFFFF",
+            "size": 14
+          },
+          {
+            "x": 443,
+            "y": 602,
+            "text": "1.7779%",
+            "color": "#FFFFFF",
+            "size": 14
+          },
+          {
+            "x": 1031,
+            "y": 195,
+            "text": "0.5236%",
+            "color": "#FFFFFF",
+            "size": 14
+          },
+          {
+            "x": 1161,
+            "y": 583,
+            "text": "3.7470%",
+            "color": "#FFFFFF",
+            "size": 14
+          }
+        ]
+      }
+    ],
+    "metrics": {
+      "total_defects": 4,
+      "total_cathode_area_px": 1296730.5,
+      "total_defect_area_px": 78938,
+      "avg_area_ratio": 0.015218659544138122,
+      "avg_area_percentage": 1.5218659544138122,
+      "total_defect_to_cathode_ratio": 0.06087463817655249,
+      "total_defect_to_cathode_percentage": 6.087463817655249
+    },
+    "ctq_results": [
+      {
+        "feature_id": 1,
+        "label": "particle_defect_001",
+        "category": "particle_defect",
+        "measurements": {
+          "area_px": 504.5,
+          "area_ratio": 0.0003890553974013876,
+          "area_percentage": 0.03890553974013876
+        }
+      },
+      {
+        "feature_id": 3,
+        "label": "delamination_defect_002",
+        "category": "delamination_defect",
+        "measurements": {
+          "area_px": 23055,
+          "area_ratio": 0.017779330400572824,
+          "area_percentage": 1.7779330400572824
+        }
+      },
+      {
+        "feature_id": 4,
+        "label": "scratch_defect_003",
+        "category": "scratch_defect",
+        "measurements": {
+          "area_px": 6789.5,
+          "area_ratio": 0.005235860496841865,
+          "area_percentage": 0.5235860496841864
+        }
+      },
+      {
+        "feature_id": 5,
+        "label": "coating_defect_004",
+        "category": "coating_defect",
+        "measurements": {
+          "area_px": 48589,
+          "area_ratio": 0.03747039188173641,
+          "area_percentage": 3.747039188173641
+        }
+      }
+    ],
+    "stdout": "Measured 4 defects with area ratios and percentages relative to 1296730.5 px² cathode coating\r\n"
+  },
+  "created_at": "2026-03-01T19:30:51.388Z",
+  "updated_at": "2026-03-01T19:30:51.388Z",
+  "source": {
+    "image_filename": "ChatGPT Image Mar 1, 2026, 12_30_06 PM.png",
+    "image_dimensions": {
+      "width": 1536,
+      "height": 1024
+    },
+    "categories": [
+      "particle_defect",
+      "scratch_defect",
+      "delamination_defect",
+      "coating_defect",
+      "current_collector_edge",
+      "cathode_coating"
+    ],
+    "annotation_count": 6
+  },
+  "tags": [
+    "area",
+    "defect"
+  ]
+}

@@ -1,0 +1,1401 @@
+{
+  "id": "f51f63f4-f869-4565-b9bc-abbe39ebda7f",
+  "name": "Max defect measurements",
+  "description": "Do this approach:\nLooking at the current code, I can see the issue with the minimum orthogonal distance calculation. For irregularly shaped defects like coating defects, the current approach only considers perpendicular distances from contour edges, which can miss the true minimum width. I'll improve this by implementing a more robust rotating calipers approach that finds the minimum width by testing all possible orientations.\n\nThe new approach will:\n1. Use rotating calipers to find the true minimum width across all orientations\n2. Handle irregular shapes better by considering the entire contour boundary\n3. Provide more accurate measurements for coating defects and other complex shapes",
+  "code": "import cv2\nimport numpy as np\nimport json\nimport os\nimport math\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results in pixels.\n\ndef rotate_points(points, angle, center):\n    \"\"\"Rotate points around a center by given angle (in radians).\"\"\"\n    cos_angle = math.cos(angle)\n    sin_angle = math.sin(angle)\n    \n    # Translate to origin\n    translated = points - center\n    \n    # Apply rotation matrix\n    rotated = np.zeros_like(translated)\n    rotated[:, 0] = translated[:, 0] * cos_angle - translated[:, 1] * sin_angle\n    rotated[:, 1] = translated[:, 0] * sin_angle + translated[:, 1] * cos_angle\n    \n    # Translate back\n    return rotated + center\n\ndef get_width_at_angle(contour, angle):\n    \"\"\"Calculate the width of a contour when projected at a given angle.\"\"\"\n    points = contour.reshape(-1, 2).astype(np.float64)\n    \n    # Get contour center for rotation\n    moments = cv2.moments(contour)\n    if moments['m00'] == 0:\n        return 0, None, None\n    \n    center = np.array([moments['m10'] / moments['m00'], moments['m01'] / moments['m00']])\n    \n    # Rotate points so that the measurement direction becomes horizontal\n    rotated_points = rotate_points(points, -angle, center)\n    \n    # Find min/max Y coordinates (width in the measurement direction)\n    min_y = np.min(rotated_points[:, 1])\n    max_y = np.max(rotated_points[:, 1])\n    width = max_y - min_y\n    \n    # Find the actual points that correspond to min/max Y\n    min_idx = np.argmin(rotated_points[:, 1])\n    max_idx = np.argmax(rotated_points[:, 1])\n    \n    # Return original (unrotated) coordinates of the extreme points\n    return width, tuple(points[min_idx]), tuple(points[max_idx])\n\ndef rotating_calipers_min_width(contour):\n    \"\"\"\n    Use rotating calipers to find the minimum width across all orientations.\n    Tests angles from 0 to 180 degrees with fine granularity.\n    \"\"\"\n    points = contour.reshape(-1, 2).astype(np.float64)\n    \n    if len(points) < 3:\n        # Fallback for very simple shapes\n        if len(points) == 2:\n            dist = np.linalg.norm(points[1] - points[0])\n            return dist, tuple(points[0]), tuple(points[1])\n        else:\n            return 0, (0, 0), (0, 0)\n    \n    # Test angles from 0 to 180 degrees with 1-degree increments\n    min_width = float('inf')\n    best_angle = 0\n    best_points = None\n    \n    # First pass: coarse search every 5 degrees\n    for degrees in range(0, 180, 5):\n        angle = math.radians(degrees)\n        width, pt1, pt2 = get_width_at_angle(contour, angle)\n        \n        if width < min_width and width > 0:\n            min_width = width\n            best_angle = angle\n            best_points = (pt1, pt2)\n    \n    # Second pass: fine search around the best angle found\n    best_degrees = math.degrees(best_angle)\n    for fine_degrees in np.arange(max(0, best_degrees - 5), \n                                  min(180, best_degrees + 5), 0.5):\n        angle = math.radians(fine_degrees)\n        width, pt1, pt2 = get_width_at_angle(contour, angle)\n        \n        if width < min_width and width > 0:\n            min_width = width\n            best_points = (pt1, pt2)\n    \n    return min_width, best_points[0], best_points[1]\n\ndef get_max_distance_between_points(contour):\n    \"\"\"Find the maximum distance between any two points on the contour.\"\"\"\n    points = contour.reshape(-1, 2).astype(np.float64)\n    max_distance = 0\n    best_pair = None\n    \n    # For efficiency, we can sample points if the contour is very dense\n    if len(points) > 100:\n        # Sample every nth point to reduce computation\n        step = len(points) // 50\n        sampled_indices = list(range(0, len(points), step))\n        # Always include the last point\n        if sampled_indices[-1] != len(points) - 1:\n            sampled_indices.append(len(points) - 1)\n    else:\n        sampled_indices = list(range(len(points)))\n    \n    for i in sampled_indices:\n        for j in sampled_indices:\n            if i != j:\n                distance = np.linalg.norm(points[j] - points[i])\n                if distance > max_distance:\n                    max_distance = distance\n                    best_pair = (tuple(points[i]), tuple(points[j]))\n    \n    return max_distance, best_pair[0], best_pair[1]\n\ndef measure_max_min_spans_rotating_calipers(defect_contour):\n    \"\"\"\n    Measure maximum span and minimum orthogonal width using rotating calipers approach.\n    This provides more accurate measurements for irregular shapes.\n    \"\"\"\n    # Get maximum span (longest distance between any two points)\n    max_span, max_pt1, max_pt2 = get_max_distance_between_points(defect_contour)\n    \n    # Get minimum width using rotating calipers\n    min_width, min_pt1, min_pt2 = rotating_calipers_min_width(defect_contour)\n    \n    return {\n        \"max_span_px\": float(max_span),\n        \"min_span_px\": float(min_width),\n        \"max_span_line\": (max_pt1, max_pt2),\n        \"min_span_line\": (min_pt1, min_pt2)\n    }\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"ChatGPT Image Mar 1, 2026, 12_30_16 PM.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(ctq_results):\n    \"\"\"Create visual overlays showing defect max/min spans with measurement arrows.\"\"\"\n    overlays = []\n    \n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    # Add bounding boxes for each defect\n    bbox_overlays = []\n    text_overlays = []\n    measurement_lines = []\n    \n    for result in ctq_results:\n        if 'defect_bbox' in result:\n            x, y, width, height = result['defect_bbox']\n            max_span = result['measurements']['max_span_px']\n            min_span = result['measurements']['min_span_px']\n            color = colors.get(result['category'], '#FFFFFF')\n            \n            # Add bounding box\n            bbox_overlays.append({\n                \"x\": int(x),\n                \"y\": int(y),\n                \"width\": int(width),\n                \"height\": int(height),\n                \"label\": result['label'],\n                \"color\": color\n            })\n            \n            # Add dimension text near the defect\n            text_overlays.append({\n                \"x\": int(x + width + 5),\n                \"y\": int(y + height // 2),\n                \"text\": f\"Max: {max_span:.1f} px\\nMin: {min_span:.1f} px\",\n                \"color\": color,\n                \"size\": 12\n            })\n            \n            # Add measurement arrows for maximum span\n            if 'max_span_line' in result['measurements']:\n                start_pt, end_pt = result['measurements']['max_span_line']\n                measurement_lines.append({\n                    \"start\": [int(start_pt[0]), int(start_pt[1])],\n                    \"end\": [int(end_pt[0]), int(end_pt[1])],\n                    \"value\": f\"{max_span:.1f} px\",\n                    \"color\": color\n                })\n            \n            # Add measurement arrows for minimum span (with slightly different color)\n            if 'min_span_line' in result['measurements']:\n                start_pt, end_pt = result['measurements']['min_span_line']\n                # Use a darker version of the main color for min span\n                min_color = color\n                if color == '#FFFF00':  # Yellow -> Orange\n                    min_color = '#FF8800'\n                elif color == '#FF0000':  # Red -> Dark Red\n                    min_color = '#CC0000'\n                elif color == '#00FF00':  # Green -> Dark Green\n                    min_color = '#00CC00'\n                elif color == '#0000FF':  # Blue -> Dark Blue\n                    min_color = '#0000CC'\n                \n                measurement_lines.append({\n                    \"start\": [int(start_pt[0]), int(start_pt[1])],\n                    \"end\": [int(end_pt[0]), int(end_pt[1])],\n                    \"value\": f\"{min_span:.1f} px\",\n                    \"color\": min_color\n                })\n    \n    if bbox_overlays:\n        overlays.append({\n            \"type\": \"bboxes\",\n            \"boxes\": bbox_overlays\n        })\n    \n    if text_overlays:\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": text_overlays\n        })\n    \n    if measurement_lines:\n        overlays.append({\n            \"type\": \"measurements\",\n            \"lines\": measurement_lines\n        })\n    \n    # Add contour overlays for defects\n    for result in ctq_results:\n        if 'defect_contour' in result:\n            contour_points = result['defect_contour'].reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(result['category'], '#FFFFFF'),\n                \"label\": result['label']\n            })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Filter annotations to only defects\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    if not defect_annotations:\n        result = {\n            \"overlays\": [],\n            \"metrics\": {\"error\": \"No defect annotations found\"},\n            \"ctq_results\": [],\n            \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f)\n        print(\"Error: No defect annotations found\")\n        return\n    \n    # Build CTQ results - measure max/min spans for each defect\n    ctq_results = []\n    defect_counter = 1\n    total_max_span = 0\n    total_min_span = 0\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            defect_contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Measure max and min spans using rotating calipers\n            measurements = measure_max_min_spans_rotating_calipers(defect_contour)\n            total_max_span += measurements[\"max_span_px\"]\n            total_min_span += measurements[\"min_span_px\"]\n            \n            # Get bounding box for overlay\n            x, y, width, height = cv2.boundingRect(defect_contour)\n            \n            # Store measurement data for CTQ results (excluding line endpoints for JSON)\n            ctq_measurements = {\n                \"max_span_px\": measurements[\"max_span_px\"],\n                \"min_span_px\": measurements[\"min_span_px\"]\n            }\n            \n            ctq_results.append({\n                \"feature_id\": int(ann[\"id\"]),\n                \"label\": f\"{category_name}_{defect_counter:03d}\",\n                \"category\": category_name,\n                \"measurements\": {**ctq_measurements, **measurements},  # Include line data for overlay generation\n                \"defect_contour\": defect_contour,  # Store for overlay generation\n                \"defect_bbox\": (x, y, width, height)  # Store for overlay generation\n            })\n            defect_counter += 1\n    \n    # Calculate average spans\n    avg_max_span = total_max_span / len(ctq_results) if ctq_results else 0\n    avg_min_span = total_min_span / len(ctq_results) if ctq_results else 0\n    \n    # Build overlays\n    overlays = build_overlays(ctq_results)\n    \n    # Clean up ctq_results (remove contour, bbox, and line data before JSON serialization)\n    for result in ctq_results:\n        # Keep only the basic measurements for JSON output\n        clean_measurements = {\n            \"max_span_px\": result[\"measurements\"][\"max_span_px\"],\n            \"min_span_px\": result[\"measurements\"][\"min_span_px\"]\n        }\n        result[\"measurements\"] = clean_measurements\n        \n        # Remove non-serializable data\n        if 'defect_contour' in result:\n            del result['defect_contour']\n        if 'defect_bbox' in result:\n            del result['defect_bbox']\n    \n    # Summary metrics\n    metrics = {\n        \"total_defects\": len(ctq_results),\n        \"avg_max_span_px\": float(avg_max_span),\n        \"avg_min_span_px\": float(avg_min_span)\n    }\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Measured maximum and minimum orthogonal spans for {len(ctq_results)} defects using rotating calipers approach\")\n\nmain()\n",
+  "prompt": "Do this approach:\nLooking at the current code, I can see the issue with the minimum orthogonal distance calculation. For irregularly shaped defects like coating defects, the current approach only considers perpendicular distances from contour edges, which can miss the true minimum width. I'll improve this by implementing a more robust rotating calipers approach that finds the minimum width by testing all possible orientations.\n\nThe new approach will:\n1. Use rotating calipers to find the true minimum width across all orientations\n2. Handle irregular shapes better by considering the entire contour boundary\n3. Provide more accurate measurements for coating defects and other complex shapes",
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "Do this approach:\nLooking at the current code, I can see the issue with the minimum orthogonal distance calculation. For irregularly shaped defects like coating defects, the current approach only considers perpendicular distances from contour edges, which can miss the true minimum width. I'll improve this by implementing a more robust rotating calipers approach that finds the minimum width by testing all possible orientations.\n\nThe new approach will:\n1. Use rotating calipers to find the true minimum width across all orientations\n2. Handle irregular shapes better by considering the entire contour boundary\n3. Provide more accurate measurements for coating defects and other complex shapes",
+      "timestamp": 1772394019408
+    },
+    {
+      "role": "assistant",
+      "content": "I'll implement a rotating calipers approach to find the true minimum orthogonal width across all orientations. This method will systematically test different angles to find the narrowest width of each defect, which is particularly important for irregularly shaped coating defects where the minimum width might not align with the contour edges.",
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\nimport math\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results in pixels.\n\ndef rotate_points(points, angle, center):\n    \"\"\"Rotate points around a center by given angle (in radians).\"\"\"\n    cos_angle = math.cos(angle)\n    sin_angle = math.sin(angle)\n    \n    # Translate to origin\n    translated = points - center\n    \n    # Apply rotation matrix\n    rotated = np.zeros_like(translated)\n    rotated[:, 0] = translated[:, 0] * cos_angle - translated[:, 1] * sin_angle\n    rotated[:, 1] = translated[:, 0] * sin_angle + translated[:, 1] * cos_angle\n    \n    # Translate back\n    return rotated + center\n\ndef get_width_at_angle(contour, angle):\n    \"\"\"Calculate the width of a contour when projected at a given angle.\"\"\"\n    points = contour.reshape(-1, 2).astype(np.float64)\n    \n    # Get contour center for rotation\n    moments = cv2.moments(contour)\n    if moments['m00'] == 0:\n        return 0, None, None\n    \n    center = np.array([moments['m10'] / moments['m00'], moments['m01'] / moments['m00']])\n    \n    # Rotate points so that the measurement direction becomes horizontal\n    rotated_points = rotate_points(points, -angle, center)\n    \n    # Find min/max Y coordinates (width in the measurement direction)\n    min_y = np.min(rotated_points[:, 1])\n    max_y = np.max(rotated_points[:, 1])\n    width = max_y - min_y\n    \n    # Find the actual points that correspond to min/max Y\n    min_idx = np.argmin(rotated_points[:, 1])\n    max_idx = np.argmax(rotated_points[:, 1])\n    \n    # Return original (unrotated) coordinates of the extreme points\n    return width, tuple(points[min_idx]), tuple(points[max_idx])\n\ndef rotating_calipers_min_width(contour):\n    \"\"\"\n    Use rotating calipers to find the minimum width across all orientations.\n    Tests angles from 0 to 180 degrees with fine granularity.\n    \"\"\"\n    points = contour.reshape(-1, 2).astype(np.float64)\n    \n    if len(points) < 3:\n        # Fallback for very simple shapes\n        if len(points) == 2:\n            dist = np.linalg.norm(points[1] - points[0])\n            return dist, tuple(points[0]), tuple(points[1])\n        else:\n            return 0, (0, 0), (0, 0)\n    \n    # Test angles from 0 to 180 degrees with 1-degree increments\n    min_width = float('inf')\n    best_angle = 0\n    best_points = None\n    \n    # First pass: coarse search every 5 degrees\n    for degrees in range(0, 180, 5):\n        angle = math.radians(degrees)\n        width, pt1, pt2 = get_width_at_angle(contour, angle)\n        \n        if width < min_width and width > 0:\n            min_width = width\n            best_angle = angle\n            best_points = (pt1, pt2)\n    \n    # Second pass: fine search around the best angle found\n    best_degrees = math.degrees(best_angle)\n    for fine_degrees in np.arange(max(0, best_degrees - 5), \n                                  min(180, best_degrees + 5), 0.5):\n        angle = math.radians(fine_degrees)\n        width, pt1, pt2 = get_width_at_angle(contour, angle)\n        \n        if width < min_width and width > 0:\n            min_width = width\n            best_points = (pt1, pt2)\n    \n    return min_width, best_points[0], best_points[1]\n\ndef get_max_distance_between_points(contour):\n    \"\"\"Find the maximum distance between any two points on the contour.\"\"\"\n    points = contour.reshape(-1, 2).astype(np.float64)\n    max_distance = 0\n    best_pair = None\n    \n    # For efficiency, we can sample points if the contour is very dense\n    if len(points) > 100:\n        # Sample every nth point to reduce computation\n        step = len(points) // 50\n        sampled_indices = list(range(0, len(points), step))\n        # Always include the last point\n        if sampled_indices[-1] != len(points) - 1:\n            sampled_indices.append(len(points) - 1)\n    else:\n        sampled_indices = list(range(len(points)))\n    \n    for i in sampled_indices:\n        for j in sampled_indices:\n            if i != j:\n                distance = np.linalg.norm(points[j] - points[i])\n                if distance > max_distance:\n                    max_distance = distance\n                    best_pair = (tuple(points[i]), tuple(points[j]))\n    \n    return max_distance, best_pair[0], best_pair[1]\n\ndef measure_max_min_spans_rotating_calipers(defect_contour):\n    \"\"\"\n    Measure maximum span and minimum orthogonal width using rotating calipers approach.\n    This provides more accurate measurements for irregular shapes.\n    \"\"\"\n    # Get maximum span (longest distance between any two points)\n    max_span, max_pt1, max_pt2 = get_max_distance_between_points(defect_contour)\n    \n    # Get minimum width using rotating calipers\n    min_width, min_pt1, min_pt2 = rotating_calipers_min_width(defect_contour)\n    \n    return {\n        \"max_span_px\": float(max_span),\n        \"min_span_px\": float(min_width),\n        \"max_span_line\": (max_pt1, max_pt2),\n        \"min_span_line\": (min_pt1, min_pt2)\n    }\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"ChatGPT Image Mar 1, 2026, 12_30_16 PM.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(ctq_results):\n    \"\"\"Create visual overlays showing defect max/min spans with measurement arrows.\"\"\"\n    overlays = []\n    \n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    # Add bounding boxes for each defect\n    bbox_overlays = []\n    text_overlays = []\n    measurement_lines = []\n    \n    for result in ctq_results:\n        if 'defect_bbox' in result:\n            x, y, width, height = result['defect_bbox']\n            max_span = result['measurements']['max_span_px']\n            min_span = result['measurements']['min_span_px']\n            color = colors.get(result['category'], '#FFFFFF')\n            \n            # Add bounding box\n            bbox_overlays.append({\n                \"x\": int(x),\n                \"y\": int(y),\n                \"width\": int(width),\n                \"height\": int(height),\n                \"label\": result['label'],\n                \"color\": color\n            })\n            \n            # Add dimension text near the defect\n            text_overlays.append({\n                \"x\": int(x + width + 5),\n                \"y\": int(y + height // 2),\n                \"text\": f\"Max: {max_span:.1f} px\\nMin: {min_span:.1f} px\",\n                \"color\": color,\n                \"size\": 12\n            })\n            \n            # Add measurement arrows for maximum span\n            if 'max_span_line' in result['measurements']:\n                start_pt, end_pt = result['measurements']['max_span_line']\n                measurement_lines.append({\n                    \"start\": [int(start_pt[0]), int(start_pt[1])],\n                    \"end\": [int(end_pt[0]), int(end_pt[1])],\n                    \"value\": f\"{max_span:.1f} px\",\n                    \"color\": color\n                })\n            \n            # Add measurement arrows for minimum span (with slightly different color)\n            if 'min_span_line' in result['measurements']:\n                start_pt, end_pt = result['measurements']['min_span_line']\n                # Use a darker version of the main color for min span\n                min_color = color\n                if color == '#FFFF00':  # Yellow -> Orange\n                    min_color = '#FF8800'\n                elif color == '#FF0000':  # Red -> Dark Red\n                    min_color = '#CC0000'\n                elif color == '#00FF00':  # Green -> Dark Green\n                    min_color = '#00CC00'\n                elif color == '#0000FF':  # Blue -> Dark Blue\n                    min_color = '#0000CC'\n                \n                measurement_lines.append({\n                    \"start\": [int(start_pt[0]), int(start_pt[1])],\n                    \"end\": [int(end_pt[0]), int(end_pt[1])],\n                    \"value\": f\"{min_span:.1f} px\",\n                    \"color\": min_color\n                })\n    \n    if bbox_overlays:\n        overlays.append({\n            \"type\": \"bboxes\",\n            \"boxes\": bbox_overlays\n        })\n    \n    if text_overlays:\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": text_overlays\n        })\n    \n    if measurement_lines:\n        overlays.append({\n            \"type\": \"measurements\",\n            \"lines\": measurement_lines\n        })\n    \n    # Add contour overlays for defects\n    for result in ctq_results:\n        if 'defect_contour' in result:\n            contour_points = result['defect_contour'].reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(result['category'], '#FFFFFF'),\n                \"label\": result['label']\n            })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Filter annotations to only defects\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    if not defect_annotations:\n        result = {\n            \"overlays\": [],\n            \"metrics\": {\"error\": \"No defect annotations found\"},\n            \"ctq_results\": [],\n            \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f)\n        print(\"Error: No defect annotations found\")\n        return\n    \n    # Build CTQ results - measure max/min spans for each defect\n    ctq_results = []\n    defect_counter = 1\n    total_max_span = 0\n    total_min_span = 0\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            defect_contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Measure max and min spans using rotating calipers\n            measurements = measure_max_min_spans_rotating_calipers(defect_contour)\n            total_max_span += measurements[\"max_span_px\"]\n            total_min_span += measurements[\"min_span_px\"]\n            \n            # Get bounding box for overlay\n            x, y, width, height = cv2.boundingRect(defect_contour)\n            \n            # Store measurement data for CTQ results (excluding line endpoints for JSON)\n            ctq_measurements = {\n                \"max_span_px\": measurements[\"max_span_px\"],\n                \"min_span_px\": measurements[\"min_span_px\"]\n            }\n            \n            ctq_results.append({\n                \"feature_id\": int(ann[\"id\"]),\n                \"label\": f\"{category_name}_{defect_counter:03d}\",\n                \"category\": category_name,\n                \"measurements\": {**ctq_measurements, **measurements},  # Include line data for overlay generation\n                \"defect_contour\": defect_contour,  # Store for overlay generation\n                \"defect_bbox\": (x, y, width, height)  # Store for overlay generation\n            })\n            defect_counter += 1\n    \n    # Calculate average spans\n    avg_max_span = total_max_span / len(ctq_results) if ctq_results else 0\n    avg_min_span = total_min_span / len(ctq_results) if ctq_results else 0\n    \n    # Build overlays\n    overlays = build_overlays(ctq_results)\n    \n    # Clean up ctq_results (remove contour, bbox, and line data before JSON serialization)\n    for result in ctq_results:\n        # Keep only the basic measurements for JSON output\n        clean_measurements = {\n            \"max_span_px\": result[\"measurements\"][\"max_span_px\"],\n            \"min_span_px\": result[\"measurements\"][\"min_span_px\"]\n        }\n        result[\"measurements\"] = clean_measurements\n        \n        # Remove non-serializable data\n        if 'defect_contour' in result:\n            del result['defect_contour']\n        if 'defect_bbox' in result:\n            del result['defect_bbox']\n    \n    # Summary metrics\n    metrics = {\n        \"total_defects\": len(ctq_results),\n        \"avg_max_span_px\": float(avg_max_span),\n        \"avg_min_span_px\": float(avg_min_span)\n    }\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Measured maximum and minimum orthogonal spans for {len(ctq_results)} defects using rotating calipers approach\")\n\nmain()\n",
+      "timestamp": 1772394019408
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 5 features measured.",
+      "timestamp": 1772394019715
+    }
+  ],
+  "last_result": {
+    "overlays": [
+      {
+        "type": "bboxes",
+        "boxes": [
+          {
+            "x": 391,
+            "y": 576,
+            "width": 22,
+            "height": 19,
+            "label": "particle_defect_001",
+            "color": "#FF0000"
+          },
+          {
+            "x": 508,
+            "y": 870,
+            "width": 33,
+            "height": 26,
+            "label": "particle_defect_002",
+            "color": "#FF0000"
+          },
+          {
+            "x": 861,
+            "y": 131,
+            "width": 311,
+            "height": 145,
+            "label": "delamination_defect_003",
+            "color": "#0000FF"
+          },
+          {
+            "x": 516,
+            "y": 366,
+            "width": 349,
+            "height": 167,
+            "label": "scratch_defect_004",
+            "color": "#00FF00"
+          },
+          {
+            "x": 1129,
+            "y": 602,
+            "width": 300,
+            "height": 245,
+            "label": "coating_defect_005",
+            "color": "#FFFF00"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "entries": [
+          {
+            "x": 418,
+            "y": 585,
+            "text": "Max: 22.0 px\nMin: 16.0 px",
+            "color": "#FF0000",
+            "size": 12
+          },
+          {
+            "x": 546,
+            "y": 883,
+            "text": "Max: 32.6 px\nMin: 23.7 px",
+            "color": "#FF0000",
+            "size": 12
+          },
+          {
+            "x": 1177,
+            "y": 203,
+            "text": "Max: 313.2 px\nMin: 132.3 px",
+            "color": "#0000FF",
+            "size": 12
+          },
+          {
+            "x": 870,
+            "y": 449,
+            "text": "Max: 385.6 px\nMin: 49.5 px",
+            "color": "#00FF00",
+            "size": 12
+          },
+          {
+            "x": 1434,
+            "y": 724,
+            "text": "Max: 312.3 px\nMin: 223.1 px",
+            "color": "#FFFF00",
+            "size": 12
+          }
+        ]
+      },
+      {
+        "type": "measurements",
+        "lines": [
+          {
+            "start": [
+              409,
+              577
+            ],
+            "end": [
+              392,
+              591
+            ],
+            "value": "22.0 px",
+            "color": "#FF0000"
+          },
+          {
+            "start": [
+              406,
+              593
+            ],
+            "end": [
+              391,
+              585
+            ],
+            "value": "16.0 px",
+            "color": "#CC0000"
+          },
+          {
+            "start": [
+              508,
+              878
+            ],
+            "end": [
+              540,
+              884
+            ],
+            "value": "32.6 px",
+            "color": "#FF0000"
+          },
+          {
+            "start": [
+              515,
+              870
+            ],
+            "end": [
+              517,
+              894
+            ],
+            "value": "23.7 px",
+            "color": "#CC0000"
+          },
+          {
+            "start": [
+              861,
+              164
+            ],
+            "end": [
+              1171,
+              209
+            ],
+            "value": "313.2 px",
+            "color": "#0000FF"
+          },
+          {
+            "start": [
+              1048,
+              133
+            ],
+            "end": [
+              993,
+              255
+            ],
+            "value": "132.3 px",
+            "color": "#0000CC"
+          },
+          {
+            "start": [
+              516,
+              366
+            ],
+            "end": [
+              864,
+              532
+            ],
+            "value": "385.6 px",
+            "color": "#00FF00"
+          },
+          {
+            "start": [
+              679,
+              420
+            ],
+            "end": [
+              670,
+              472
+            ],
+            "value": "49.5 px",
+            "color": "#00CC00"
+          },
+          {
+            "start": [
+              1129,
+              658
+            ],
+            "end": [
+              1422,
+              766
+            ],
+            "value": "312.3 px",
+            "color": "#FFFF00"
+          },
+          {
+            "start": [
+              1358,
+              610
+            ],
+            "end": [
+              1264,
+              842
+            ],
+            "value": "223.1 px",
+            "color": "#FF8800"
+          }
+        ]
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            409,
+            577
+          ],
+          [
+            401,
+            576
+          ],
+          [
+            391,
+            585
+          ],
+          [
+            392,
+            591
+          ],
+          [
+            396,
+            594
+          ],
+          [
+            406,
+            593
+          ],
+          [
+            412,
+            582
+          ]
+        ],
+        "color": "#FF0000",
+        "label": "particle_defect_001"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            511,
+            872
+          ],
+          [
+            508,
+            878
+          ],
+          [
+            513,
+            890
+          ],
+          [
+            517,
+            894
+          ],
+          [
+            530,
+            895
+          ],
+          [
+            540,
+            884
+          ],
+          [
+            532,
+            874
+          ],
+          [
+            526,
+            871
+          ],
+          [
+            515,
+            870
+          ]
+        ],
+        "color": "#FF0000",
+        "label": "particle_defect_002"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            861,
+            164
+          ],
+          [
+            865,
+            184
+          ],
+          [
+            878,
+            193
+          ],
+          [
+            876,
+            198
+          ],
+          [
+            890,
+            208
+          ],
+          [
+            887,
+            212
+          ],
+          [
+            893,
+            217
+          ],
+          [
+            897,
+            217
+          ],
+          [
+            898,
+            219
+          ],
+          [
+            902,
+            217
+          ],
+          [
+            908,
+            217
+          ],
+          [
+            909,
+            219
+          ],
+          [
+            917,
+            218
+          ],
+          [
+            946,
+            238
+          ],
+          [
+            954,
+            235
+          ],
+          [
+            958,
+            241
+          ],
+          [
+            974,
+            243
+          ],
+          [
+            993,
+            255
+          ],
+          [
+            1016,
+            256
+          ],
+          [
+            1026,
+            261
+          ],
+          [
+            1038,
+            261
+          ],
+          [
+            1042,
+            265
+          ],
+          [
+            1048,
+            264
+          ],
+          [
+            1059,
+            273
+          ],
+          [
+            1067,
+            275
+          ],
+          [
+            1086,
+            274
+          ],
+          [
+            1106,
+            261
+          ],
+          [
+            1113,
+            262
+          ],
+          [
+            1130,
+            259
+          ],
+          [
+            1159,
+            251
+          ],
+          [
+            1166,
+            234
+          ],
+          [
+            1165,
+            216
+          ],
+          [
+            1171,
+            209
+          ],
+          [
+            1168,
+            204
+          ],
+          [
+            1162,
+            203
+          ],
+          [
+            1160,
+            200
+          ],
+          [
+            1154,
+            201
+          ],
+          [
+            1150,
+            194
+          ],
+          [
+            1138,
+            182
+          ],
+          [
+            1108,
+            178
+          ],
+          [
+            1086,
+            171
+          ],
+          [
+            1074,
+            158
+          ],
+          [
+            1075,
+            151
+          ],
+          [
+            1070,
+            147
+          ],
+          [
+            1066,
+            147
+          ],
+          [
+            1062,
+            140
+          ],
+          [
+            1048,
+            133
+          ],
+          [
+            1003,
+            138
+          ],
+          [
+            984,
+            144
+          ],
+          [
+            966,
+            144
+          ],
+          [
+            932,
+            133
+          ],
+          [
+            912,
+            131
+          ],
+          [
+            892,
+            138
+          ],
+          [
+            883,
+            146
+          ],
+          [
+            872,
+            151
+          ]
+        ],
+        "color": "#0000FF",
+        "label": "delamination_defect_003"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            516,
+            366
+          ],
+          [
+            518,
+            373
+          ],
+          [
+            529,
+            380
+          ],
+          [
+            536,
+            381
+          ],
+          [
+            542,
+            387
+          ],
+          [
+            560,
+            396
+          ],
+          [
+            587,
+            414
+          ],
+          [
+            601,
+            419
+          ],
+          [
+            609,
+            429
+          ],
+          [
+            633,
+            437
+          ],
+          [
+            645,
+            445
+          ],
+          [
+            660,
+            450
+          ],
+          [
+            665,
+            456
+          ],
+          [
+            663,
+            460
+          ],
+          [
+            666,
+            464
+          ],
+          [
+            665,
+            468
+          ],
+          [
+            670,
+            472
+          ],
+          [
+            699,
+            480
+          ],
+          [
+            714,
+            490
+          ],
+          [
+            736,
+            495
+          ],
+          [
+            744,
+            500
+          ],
+          [
+            759,
+            502
+          ],
+          [
+            781,
+            509
+          ],
+          [
+            791,
+            515
+          ],
+          [
+            803,
+            516
+          ],
+          [
+            845,
+            531
+          ],
+          [
+            864,
+            532
+          ],
+          [
+            856,
+            524
+          ],
+          [
+            846,
+            521
+          ],
+          [
+            819,
+            505
+          ],
+          [
+            803,
+            501
+          ],
+          [
+            759,
+            479
+          ],
+          [
+            750,
+            469
+          ],
+          [
+            739,
+            465
+          ],
+          [
+            719,
+            447
+          ],
+          [
+            695,
+            435
+          ],
+          [
+            679,
+            420
+          ],
+          [
+            665,
+            415
+          ],
+          [
+            632,
+            413
+          ],
+          [
+            622,
+            409
+          ],
+          [
+            611,
+            408
+          ],
+          [
+            600,
+            402
+          ],
+          [
+            590,
+            401
+          ],
+          [
+            543,
+            373
+          ],
+          [
+            536,
+            372
+          ],
+          [
+            525,
+            366
+          ]
+        ],
+        "color": "#00FF00",
+        "label": "scratch_defect_004"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            1347,
+            602
+          ],
+          [
+            1345,
+            604
+          ],
+          [
+            1335,
+            603
+          ],
+          [
+            1326,
+            606
+          ],
+          [
+            1317,
+            603
+          ],
+          [
+            1297,
+            604
+          ],
+          [
+            1272,
+            609
+          ],
+          [
+            1243,
+            620
+          ],
+          [
+            1217,
+            641
+          ],
+          [
+            1206,
+            646
+          ],
+          [
+            1172,
+            640
+          ],
+          [
+            1156,
+            640
+          ],
+          [
+            1143,
+            643
+          ],
+          [
+            1136,
+            647
+          ],
+          [
+            1129,
+            658
+          ],
+          [
+            1129,
+            678
+          ],
+          [
+            1132,
+            688
+          ],
+          [
+            1139,
+            698
+          ],
+          [
+            1153,
+            704
+          ],
+          [
+            1171,
+            701
+          ],
+          [
+            1176,
+            697
+          ],
+          [
+            1193,
+            698
+          ],
+          [
+            1197,
+            696
+          ],
+          [
+            1216,
+            701
+          ],
+          [
+            1236,
+            716
+          ],
+          [
+            1235,
+            721
+          ],
+          [
+            1239,
+            735
+          ],
+          [
+            1240,
+            752
+          ],
+          [
+            1253,
+            754
+          ],
+          [
+            1260,
+            759
+          ],
+          [
+            1266,
+            771
+          ],
+          [
+            1273,
+            767
+          ],
+          [
+            1279,
+            774
+          ],
+          [
+            1277,
+            776
+          ],
+          [
+            1279,
+            781
+          ],
+          [
+            1271,
+            786
+          ],
+          [
+            1271,
+            789
+          ],
+          [
+            1274,
+            791
+          ],
+          [
+            1269,
+            795
+          ],
+          [
+            1260,
+            796
+          ],
+          [
+            1259,
+            789
+          ],
+          [
+            1254,
+            787
+          ],
+          [
+            1258,
+            786
+          ],
+          [
+            1257,
+            782
+          ],
+          [
+            1254,
+            782
+          ],
+          [
+            1252,
+            785
+          ],
+          [
+            1246,
+            782
+          ],
+          [
+            1241,
+            785
+          ],
+          [
+            1233,
+            783
+          ],
+          [
+            1232,
+            786
+          ],
+          [
+            1234,
+            787
+          ],
+          [
+            1232,
+            789
+          ],
+          [
+            1229,
+            787
+          ],
+          [
+            1231,
+            792
+          ],
+          [
+            1228,
+            795
+          ],
+          [
+            1237,
+            801
+          ],
+          [
+            1233,
+            806
+          ],
+          [
+            1245,
+            815
+          ],
+          [
+            1247,
+            819
+          ],
+          [
+            1252,
+            820
+          ],
+          [
+            1250,
+            824
+          ],
+          [
+            1257,
+            822
+          ],
+          [
+            1263,
+            826
+          ],
+          [
+            1261,
+            831
+          ],
+          [
+            1264,
+            842
+          ],
+          [
+            1268,
+            846
+          ],
+          [
+            1286,
+            846
+          ],
+          [
+            1287,
+            844
+          ],
+          [
+            1295,
+            846
+          ],
+          [
+            1299,
+            840
+          ],
+          [
+            1296,
+            840
+          ],
+          [
+            1291,
+            834
+          ],
+          [
+            1296,
+            832
+          ],
+          [
+            1295,
+            822
+          ],
+          [
+            1292,
+            820
+          ],
+          [
+            1298,
+            814
+          ],
+          [
+            1301,
+            814
+          ],
+          [
+            1305,
+            818
+          ],
+          [
+            1307,
+            815
+          ],
+          [
+            1313,
+            813
+          ],
+          [
+            1315,
+            805
+          ],
+          [
+            1326,
+            811
+          ],
+          [
+            1332,
+            808
+          ],
+          [
+            1336,
+            809
+          ],
+          [
+            1335,
+            805
+          ],
+          [
+            1343,
+            807
+          ],
+          [
+            1352,
+            800
+          ],
+          [
+            1358,
+            802
+          ],
+          [
+            1355,
+            800
+          ],
+          [
+            1358,
+            797
+          ],
+          [
+            1363,
+            799
+          ],
+          [
+            1365,
+            796
+          ],
+          [
+            1374,
+            792
+          ],
+          [
+            1373,
+            787
+          ],
+          [
+            1380,
+            789
+          ],
+          [
+            1384,
+            785
+          ],
+          [
+            1390,
+            790
+          ],
+          [
+            1396,
+            785
+          ],
+          [
+            1395,
+            780
+          ],
+          [
+            1398,
+            776
+          ],
+          [
+            1403,
+            775
+          ],
+          [
+            1411,
+            767
+          ],
+          [
+            1422,
+            766
+          ],
+          [
+            1428,
+            756
+          ],
+          [
+            1428,
+            736
+          ],
+          [
+            1422,
+            731
+          ],
+          [
+            1409,
+            731
+          ],
+          [
+            1401,
+            736
+          ],
+          [
+            1394,
+            734
+          ],
+          [
+            1385,
+            739
+          ],
+          [
+            1368,
+            739
+          ],
+          [
+            1359,
+            730
+          ],
+          [
+            1354,
+            732
+          ],
+          [
+            1345,
+            730
+          ],
+          [
+            1341,
+            733
+          ],
+          [
+            1337,
+            729
+          ],
+          [
+            1330,
+            731
+          ],
+          [
+            1323,
+            727
+          ],
+          [
+            1332,
+            721
+          ],
+          [
+            1332,
+            719
+          ],
+          [
+            1327,
+            718
+          ],
+          [
+            1328,
+            714
+          ],
+          [
+            1339,
+            711
+          ],
+          [
+            1344,
+            707
+          ],
+          [
+            1340,
+            702
+          ],
+          [
+            1343,
+            698
+          ],
+          [
+            1339,
+            695
+          ],
+          [
+            1342,
+            692
+          ],
+          [
+            1340,
+            688
+          ],
+          [
+            1346,
+            681
+          ],
+          [
+            1347,
+            671
+          ],
+          [
+            1352,
+            671
+          ],
+          [
+            1364,
+            665
+          ],
+          [
+            1364,
+            655
+          ],
+          [
+            1351,
+            653
+          ],
+          [
+            1343,
+            638
+          ],
+          [
+            1344,
+            627
+          ],
+          [
+            1348,
+            625
+          ],
+          [
+            1344,
+            620
+          ],
+          [
+            1348,
+            618
+          ],
+          [
+            1348,
+            615
+          ],
+          [
+            1345,
+            613
+          ],
+          [
+            1354,
+            614
+          ],
+          [
+            1358,
+            610
+          ],
+          [
+            1354,
+            606
+          ],
+          [
+            1346,
+            607
+          ]
+        ],
+        "color": "#FFFF00",
+        "label": "coating_defect_005"
+      }
+    ],
+    "metrics": {
+      "total_defects": 5,
+      "avg_max_span_px": 213.13293919334873,
+      "avg_min_span_px": 88.93184424143874
+    },
+    "ctq_results": [
+      {
+        "feature_id": 20,
+        "label": "particle_defect_001",
+        "category": "particle_defect",
+        "measurements": {
+          "max_span_px": 22.02271554554524,
+          "min_span_px": 15.982117699202036
+        }
+      },
+      {
+        "feature_id": 21,
+        "label": "particle_defect_002",
+        "category": "particle_defect",
+        "measurements": {
+          "max_span_px": 32.55764119219941,
+          "min_span_px": 23.734361268706493
+        }
+      },
+      {
+        "feature_id": 23,
+        "label": "delamination_defect_003",
+        "category": "delamination_defect",
+        "measurements": {
+          "max_span_px": 313.2491021535417,
+          "min_span_px": 132.26102597575613
+        }
+      },
+      {
+        "feature_id": 24,
+        "label": "scratch_defect_004",
+        "category": "scratch_defect",
+        "measurements": {
+          "max_span_px": 385.56452118938535,
+          "min_span_px": 49.53332099679079
+        }
+      },
+      {
+        "feature_id": 25,
+        "label": "coating_defect_005",
+        "category": "coating_defect",
+        "measurements": {
+          "max_span_px": 312.27071588607214,
+          "min_span_px": 223.14839526673825
+        }
+      }
+    ],
+    "stdout": "Measured maximum and minimum orthogonal spans for 5 defects using rotating calipers approach\r\n"
+  },
+  "created_at": "2026-03-01T19:41:15.717Z",
+  "updated_at": "2026-03-01T19:41:15.717Z",
+  "source": {
+    "image_filename": "ChatGPT Image Mar 1, 2026, 12_30_16 PM.png",
+    "image_dimensions": {
+      "width": 1536,
+      "height": 1024
+    },
+    "categories": [
+      "particle_defect",
+      "scratch_defect",
+      "delamination_defect",
+      "coating_defect",
+      "current_collector_edge",
+      "cathode_coating"
+    ],
+    "annotation_count": 7
+  },
+  "tags": [
+    "defect",
+    "measurement"
+  ]
+}

@@ -1,0 +1,261 @@
+{
+  "id": "83f66308-a2c8-4a83-9d67-94e463b50c3f",
+  "name": "centroid tab distance",
+  "description": "Measure the centroid distance between tabs",
+  "code": "import cv2\nimport numpy as np\nimport json\nimport os\nimport math\nfrom itertools import combinations\n\n# --- CONFIGURATION ---\nTAB_CATEGORY       = \"Tab\"        # Category name to measure centroids for\nTAB_COLOR          = \"#00AAFF\"    # Overlay colour for tab contours\nCENTROID_COLOR     = \"#FFE800\"    # Overlay colour for centroid markers\nLINE_COLOR         = \"#FF00FF\"    # Overlay colour for distance measurement lines\nTEXT_COLOR         = \"#FFFFFF\"    # Summary text colour\nIMAGE_EXTENSIONS   = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n\ndef contour_from_polygon_annotation(ann):\n    \"\"\"Extract the largest polygon segment from a COCO polygon annotation.\n    Returns an (N,1,2) int32 contour, or None if unavailable.\"\"\"\n    seg = ann.get(\"segmentation\", [])\n    if not isinstance(seg, list) or len(seg) == 0:\n        return None\n    largest = max(seg, key=lambda s: len(s))\n    pts = np.array(largest, dtype=np.float64).reshape(-1, 2)\n    return pts.reshape(-1, 1, 2).astype(np.int32)\n\ndef measure_centroid(contour):\n    \"\"\"Compute the centroid (cx, cy) of any contour using image moments.\n    Returns a (float, float) tuple, or None if the contour has zero area.\"\"\"\n    M = cv2.moments(contour)\n    if abs(M[\"m00\"]) < 1e-6:\n        return None\n    cx = M[\"m10\"] / M[\"m00\"]\n    cy = M[\"m01\"] / M[\"m00\"]\n    return float(cx), float(cy)\n\ndef measure_centroid_distance(centroid_a, centroid_b):\n    \"\"\"Euclidean distance in pixels between two (cx, cy) centroid tuples.\"\"\"\n    dx = centroid_a[0] - centroid_b[0]\n    dy = centroid_a[1] - centroid_b[1]\n    return float(math.sqrt(dx * dx + dy * dy))\n\ndef contour_to_overlay_points(contour):\n    \"\"\"Convert an (N,1,2) contour to a plain [[x,y],...] list for overlays.\"\"\"\n    return [[int(p[0][0]), int(p[0][1])] for p in contour]\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef find_image_file():\n    \"\"\"Find the image file in INPUT_DIR (there is always exactly one).\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\ndef load_data():\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef write_error_result(msg):\n    result = {\"overlays\": [], \"metrics\": {\"error\": msg}, \"ctq_results\": [], \"stdout\": msg}\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n    print(f\"ERROR: {msg}\")\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        write_error_result(\"Image load failed\")\n        return\n\n    # ── Filter Tab annotations ───────────────────────────────────────────────\n    tab_anns = [a for a in coco[\"annotations\"] if cat_map[a[\"category_id\"]] == TAB_CATEGORY]\n\n    if len(tab_anns) == 0:\n        write_error_result(f\"No annotations found for category '{TAB_CATEGORY}'\")\n        return\n    if len(tab_anns) < 2:\n        write_error_result(f\"Only 1 '{TAB_CATEGORY}' annotation found — need at least 2 to measure distance\")\n        return\n\n    overlays    = []\n    ctq_results = []\n\n    # ── Extract contours and centroids for each tab ──────────────────────────\n    tab_features = []   # list of dicts: {ann, contour, centroid}\n    for idx, ann in enumerate(tab_anns):\n        contour = contour_from_polygon_annotation(ann)\n        if contour is None:\n            print(f\"WARNING: Could not extract contour for Tab annotation id={ann['id']}, skipping\")\n            continue\n\n        centroid = measure_centroid(contour)\n        if centroid is None:\n            print(f\"WARNING: Zero-area contour for Tab annotation id={ann['id']}, skipping\")\n            continue\n\n        tab_features.append({\"ann\": ann, \"contour\": contour, \"centroid\": centroid, \"index\": idx + 1})\n\n        # Draw the tab contour\n        overlays.append({\n            \"type\":   \"contours\",\n            \"points\": contour_to_overlay_points(contour),\n            \"color\":  TAB_COLOR,\n            \"label\":  f\"Tab {idx + 1}\",\n        })\n\n        # Mark centroid with a small cross using a text label \"+\" \n        cx, cy = centroid\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": [\n                {\n                    \"x\":    int(round(cx)) - 6,\n                    \"y\":    int(round(cy)) + 6,\n                    \"text\": \"+\",\n                    \"color\": CENTROID_COLOR,\n                    \"size\": 16,\n                }\n            ],\n        })\n\n        # One CTQ result per tab with its centroid location\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\":      f\"tab_{idx + 1:03d}\",\n            \"category\":   TAB_CATEGORY,\n            \"measurements\": {\n                \"centroid_x_px\": round(centroid[0], 2),\n                \"centroid_y_px\": round(centroid[1], 2),\n            },\n        })\n\n    if len(tab_features) < 2:\n        write_error_result(\"Fewer than 2 valid Tab contours — cannot compute distance\")\n        return\n\n    # ── Measure centroid-to-centroid distance for all pairs ──────────────────\n    pair_distances = []\n    for feat_a, feat_b in combinations(tab_features, 2):\n        dist = measure_centroid_distance(feat_a[\"centroid\"], feat_b[\"centroid\"])\n        ca   = feat_a[\"centroid\"]\n        cb   = feat_b[\"centroid\"]\n        label_str = (\n            f\"Tab {feat_a['index']} → Tab {feat_b['index']}: {dist:.1f} px\"\n        )\n\n        # Measurement line between centroids\n        overlays.append({\n            \"type\": \"measurements\",\n            \"lines\": [\n                {\n                    \"start\": [float(ca[0]), float(ca[1])],\n                    \"end\":   [float(cb[0]), float(cb[1])],\n                    \"value\": f\"{dist:.1f} px\",\n                    \"color\": LINE_COLOR,\n                }\n            ],\n        })\n\n        pair_distances.append({\n            \"tab_a_index\": feat_a[\"index\"],\n            \"tab_b_index\": feat_b[\"index\"],\n            \"tab_a_id\":    int(feat_a[\"ann\"][\"id\"]),\n            \"tab_b_id\":    int(feat_b[\"ann\"][\"id\"]),\n            \"distance_px\": round(dist, 2),\n        })\n\n        # Add a pairwise CTQ result\n        ctq_results.append({\n            \"feature_id\": int(feat_a[\"ann\"][\"id\"]),   # anchor to first tab in pair\n            \"label\":      f\"tab_{feat_a['index']:03d}_to_tab_{feat_b['index']:03d}\",\n            \"category\":   TAB_CATEGORY,\n            \"measurements\": {\n                \"centroid_distance_px\": round(dist, 2),\n            },\n        })\n\n    # ── Metrics ──────────────────────────────────────────────────────────────\n    all_dists = [p[\"distance_px\"] for p in pair_distances]\n    metrics = {\n        \"num_tabs\":              int(len(tab_features)),\n        \"num_pairs\":             int(len(pair_distances)),\n        \"min_centroid_dist_px\":  round(min(all_dists), 2),\n        \"max_centroid_dist_px\":  round(max(all_dists), 2),\n        \"avg_centroid_dist_px\":  round(float(np.mean(all_dists)), 2),\n    }\n    # Add per-pair distance entries to metrics for easy reading\n    for p in pair_distances:\n        key = f\"tab_{p['tab_a_index']}_to_tab_{p['tab_b_index']}_dist_px\"\n        metrics[key] = p[\"distance_px\"]\n\n    # ── Summary text overlay ─────────────────────────────────────────────────\n    text_entries = [\n        {\"x\": 20, \"y\": 30,  \"text\": \"Tab Centroid Distances\",\n         \"color\": TEXT_COLOR, \"size\": 14},\n        {\"x\": 20, \"y\": 52,  \"text\": f\"Tabs found: {len(tab_features)}\",\n         \"color\": TAB_COLOR,  \"size\": 13},\n    ]\n    y_cursor = 72\n    for p in pair_distances:\n        text_entries.append({\n            \"x\": 20, \"y\": y_cursor,\n            \"text\": f\"Tab {p['tab_a_index']} → Tab {p['tab_b_index']}: {p['distance_px']:.1f} px\",\n            \"color\": LINE_COLOR, \"size\": 13,\n        })\n        y_cursor += 20\n    overlays.append({\"type\": \"text\", \"entries\": text_entries})\n\n    # ── Stdout summary ────────────────────────────────────────────────────────\n    pair_strs = [\n        f\"Tab {p['tab_a_index']}→Tab {p['tab_b_index']}: {p['distance_px']:.1f} px\"\n        for p in pair_distances\n    ]\n    stdout_msg = (\n        f\"Tab centroid distances ({len(tab_features)} tabs, {len(pair_distances)} pair(s)) | \"\n        + \" | \".join(pair_strs)\n    )\n\n    result = {\n        \"overlays\":    overlays,\n        \"metrics\":     metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\":      stdout_msg,\n    }\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n    print(stdout_msg)\n\nmain()",
+  "prompt": "Measure the centroid distance between tabs",
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "Measure the centroid distance between tabs",
+      "timestamp": 1772996959918
+    },
+    {
+      "role": "assistant",
+      "content": "Targeting all \"Tab\" category annotations and computing the centroid of each using contour moments. The centroid-to-centroid Euclidean distance is then measured for every pair of tabs, with measurement lines drawn between them. This script works for any number of tabs — if exactly two are present the single pair distance is reported; if more exist, all pairwise distances are computed.",
+      "thinking": "The user wants to measure the centroid distance between tabs. Looking at the categories: Tab, Seal, Defect, Cathode. I need to find all \"Tab\" annotations, compute their centroids, and measure the distance between them.\n\nSince there could be multiple tabs, I should measure distances between all pairs, or if there are exactly 2 tabs, just measure the distance between them.\n\nLet me write a script that:\n1. Finds all \"Tab\" annotations\n2. Computes the centroid of each tab contour\n3. Measures the Euclidean distance between centroids (for all pairs)\n4. Creates overlays showing the centroids and measurement lines between them",
+      "timestamp": 1772996959918,
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\nimport math\nfrom itertools import combinations\n\n# --- CONFIGURATION ---\nTAB_CATEGORY       = \"Tab\"        # Category name to measure centroids for\nTAB_COLOR          = \"#00AAFF\"    # Overlay colour for tab contours\nCENTROID_COLOR     = \"#FFE800\"    # Overlay colour for centroid markers\nLINE_COLOR         = \"#FF00FF\"    # Overlay colour for distance measurement lines\nTEXT_COLOR         = \"#FFFFFF\"    # Summary text colour\nIMAGE_EXTENSIONS   = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n\ndef contour_from_polygon_annotation(ann):\n    \"\"\"Extract the largest polygon segment from a COCO polygon annotation.\n    Returns an (N,1,2) int32 contour, or None if unavailable.\"\"\"\n    seg = ann.get(\"segmentation\", [])\n    if not isinstance(seg, list) or len(seg) == 0:\n        return None\n    largest = max(seg, key=lambda s: len(s))\n    pts = np.array(largest, dtype=np.float64).reshape(-1, 2)\n    return pts.reshape(-1, 1, 2).astype(np.int32)\n\ndef measure_centroid(contour):\n    \"\"\"Compute the centroid (cx, cy) of any contour using image moments.\n    Returns a (float, float) tuple, or None if the contour has zero area.\"\"\"\n    M = cv2.moments(contour)\n    if abs(M[\"m00\"]) < 1e-6:\n        return None\n    cx = M[\"m10\"] / M[\"m00\"]\n    cy = M[\"m01\"] / M[\"m00\"]\n    return float(cx), float(cy)\n\ndef measure_centroid_distance(centroid_a, centroid_b):\n    \"\"\"Euclidean distance in pixels between two (cx, cy) centroid tuples.\"\"\"\n    dx = centroid_a[0] - centroid_b[0]\n    dy = centroid_a[1] - centroid_b[1]\n    return float(math.sqrt(dx * dx + dy * dy))\n\ndef contour_to_overlay_points(contour):\n    \"\"\"Convert an (N,1,2) contour to a plain [[x,y],...] list for overlays.\"\"\"\n    return [[int(p[0][0]), int(p[0][1])] for p in contour]\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef find_image_file():\n    \"\"\"Find the image file in INPUT_DIR (there is always exactly one).\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\ndef load_data():\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef write_error_result(msg):\n    result = {\"overlays\": [], \"metrics\": {\"error\": msg}, \"ctq_results\": [], \"stdout\": msg}\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n    print(f\"ERROR: {msg}\")\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        write_error_result(\"Image load failed\")\n        return\n\n    # ── Filter Tab annotations ───────────────────────────────────────────────\n    tab_anns = [a for a in coco[\"annotations\"] if cat_map[a[\"category_id\"]] == TAB_CATEGORY]\n\n    if len(tab_anns) == 0:\n        write_error_result(f\"No annotations found for category '{TAB_CATEGORY}'\")\n        return\n    if len(tab_anns) < 2:\n        write_error_result(f\"Only 1 '{TAB_CATEGORY}' annotation found — need at least 2 to measure distance\")\n        return\n\n    overlays    = []\n    ctq_results = []\n\n    # ── Extract contours and centroids for each tab ──────────────────────────\n    tab_features = []   # list of dicts: {ann, contour, centroid}\n    for idx, ann in enumerate(tab_anns):\n        contour = contour_from_polygon_annotation(ann)\n        if contour is None:\n            print(f\"WARNING: Could not extract contour for Tab annotation id={ann['id']}, skipping\")\n            continue\n\n        centroid = measure_centroid(contour)\n        if centroid is None:\n            print(f\"WARNING: Zero-area contour for Tab annotation id={ann['id']}, skipping\")\n            continue\n\n        tab_features.append({\"ann\": ann, \"contour\": contour, \"centroid\": centroid, \"index\": idx + 1})\n\n        # Draw the tab contour\n        overlays.append({\n            \"type\":   \"contours\",\n            \"points\": contour_to_overlay_points(contour),\n            \"color\":  TAB_COLOR,\n            \"label\":  f\"Tab {idx + 1}\",\n        })\n\n        # Mark centroid with a small cross using a text label \"+\" \n        cx, cy = centroid\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": [\n                {\n                    \"x\":    int(round(cx)) - 6,\n                    \"y\":    int(round(cy)) + 6,\n                    \"text\": \"+\",\n                    \"color\": CENTROID_COLOR,\n                    \"size\": 16,\n                }\n            ],\n        })\n\n        # One CTQ result per tab with its centroid location\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\":      f\"tab_{idx + 1:03d}\",\n            \"category\":   TAB_CATEGORY,\n            \"measurements\": {\n                \"centroid_x_px\": round(centroid[0], 2),\n                \"centroid_y_px\": round(centroid[1], 2),\n            },\n        })\n\n    if len(tab_features) < 2:\n        write_error_result(\"Fewer than 2 valid Tab contours — cannot compute distance\")\n        return\n\n    # ── Measure centroid-to-centroid distance for all pairs ──────────────────\n    pair_distances = []\n    for feat_a, feat_b in combinations(tab_features, 2):\n        dist = measure_centroid_distance(feat_a[\"centroid\"], feat_b[\"centroid\"])\n        ca   = feat_a[\"centroid\"]\n        cb   = feat_b[\"centroid\"]\n        label_str = (\n            f\"Tab {feat_a['index']} → Tab {feat_b['index']}: {dist:.1f} px\"\n        )\n\n        # Measurement line between centroids\n        overlays.append({\n            \"type\": \"measurements\",\n            \"lines\": [\n                {\n                    \"start\": [float(ca[0]), float(ca[1])],\n                    \"end\":   [float(cb[0]), float(cb[1])],\n                    \"value\": f\"{dist:.1f} px\",\n                    \"color\": LINE_COLOR,\n                }\n            ],\n        })\n\n        pair_distances.append({\n            \"tab_a_index\": feat_a[\"index\"],\n            \"tab_b_index\": feat_b[\"index\"],\n            \"tab_a_id\":    int(feat_a[\"ann\"][\"id\"]),\n            \"tab_b_id\":    int(feat_b[\"ann\"][\"id\"]),\n            \"distance_px\": round(dist, 2),\n        })\n\n        # Add a pairwise CTQ result\n        ctq_results.append({\n            \"feature_id\": int(feat_a[\"ann\"][\"id\"]),   # anchor to first tab in pair\n            \"label\":      f\"tab_{feat_a['index']:03d}_to_tab_{feat_b['index']:03d}\",\n            \"category\":   TAB_CATEGORY,\n            \"measurements\": {\n                \"centroid_distance_px\": round(dist, 2),\n            },\n        })\n\n    # ── Metrics ──────────────────────────────────────────────────────────────\n    all_dists = [p[\"distance_px\"] for p in pair_distances]\n    metrics = {\n        \"num_tabs\":              int(len(tab_features)),\n        \"num_pairs\":             int(len(pair_distances)),\n        \"min_centroid_dist_px\":  round(min(all_dists), 2),\n        \"max_centroid_dist_px\":  round(max(all_dists), 2),\n        \"avg_centroid_dist_px\":  round(float(np.mean(all_dists)), 2),\n    }\n    # Add per-pair distance entries to metrics for easy reading\n    for p in pair_distances:\n        key = f\"tab_{p['tab_a_index']}_to_tab_{p['tab_b_index']}_dist_px\"\n        metrics[key] = p[\"distance_px\"]\n\n    # ── Summary text overlay ─────────────────────────────────────────────────\n    text_entries = [\n        {\"x\": 20, \"y\": 30,  \"text\": \"Tab Centroid Distances\",\n         \"color\": TEXT_COLOR, \"size\": 14},\n        {\"x\": 20, \"y\": 52,  \"text\": f\"Tabs found: {len(tab_features)}\",\n         \"color\": TAB_COLOR,  \"size\": 13},\n    ]\n    y_cursor = 72\n    for p in pair_distances:\n        text_entries.append({\n            \"x\": 20, \"y\": y_cursor,\n            \"text\": f\"Tab {p['tab_a_index']} → Tab {p['tab_b_index']}: {p['distance_px']:.1f} px\",\n            \"color\": LINE_COLOR, \"size\": 13,\n        })\n        y_cursor += 20\n    overlays.append({\"type\": \"text\", \"entries\": text_entries})\n\n    # ── Stdout summary ────────────────────────────────────────────────────────\n    pair_strs = [\n        f\"Tab {p['tab_a_index']}→Tab {p['tab_b_index']}: {p['distance_px']:.1f} px\"\n        for p in pair_distances\n    ]\n    stdout_msg = (\n        f\"Tab centroid distances ({len(tab_features)} tabs, {len(pair_distances)} pair(s)) | \"\n        + \" | \".join(pair_strs)\n    )\n\n    result = {\n        \"overlays\":    overlays,\n        \"metrics\":     metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\":      stdout_msg,\n    }\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n    print(stdout_msg)\n\nmain()"
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.2s. 3 features measured.",
+      "timestamp": 1772996999977
+    }
+  ],
+  "last_result": {
+    "overlays": [
+      {
+        "type": "contours",
+        "points": [
+          [
+            620,
+            130
+          ],
+          [
+            617,
+            139
+          ],
+          [
+            616,
+            197
+          ],
+          [
+            613,
+            213
+          ],
+          [
+            601,
+            223
+          ],
+          [
+            656,
+            226
+          ],
+          [
+            709,
+            224
+          ],
+          [
+            710,
+            222
+          ],
+          [
+            706,
+            216
+          ],
+          [
+            704,
+            203
+          ],
+          [
+            704,
+            130
+          ]
+        ],
+        "color": "#00AAFF",
+        "label": "Tab 1"
+      },
+      {
+        "type": "text",
+        "entries": [
+          {
+            "x": 654,
+            "y": 184,
+            "text": "+",
+            "color": "#FFE800",
+            "size": 16
+          }
+        ]
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            848,
+            129
+          ],
+          [
+            845,
+            133
+          ],
+          [
+            846,
+            195
+          ],
+          [
+            844,
+            216
+          ],
+          [
+            836,
+            223
+          ],
+          [
+            866,
+            226
+          ],
+          [
+            939,
+            225
+          ],
+          [
+            940,
+            222
+          ],
+          [
+            935,
+            215
+          ],
+          [
+            933,
+            201
+          ],
+          [
+            933,
+            143
+          ],
+          [
+            931,
+            134
+          ],
+          [
+            918,
+            130
+          ]
+        ],
+        "color": "#00AAFF",
+        "label": "Tab 2"
+      },
+      {
+        "type": "text",
+        "entries": [
+          {
+            "x": 883,
+            "y": 184,
+            "text": "+",
+            "color": "#FFE800",
+            "size": 16
+          }
+        ]
+      },
+      {
+        "type": "measurements",
+        "lines": [
+          {
+            "start": [
+              659.854289533695,
+              178.48195329087048
+            ],
+            "end": [
+              889.0572864321608,
+              178.2828850133018
+            ],
+            "value": "229.2 px",
+            "color": "#FF00FF"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "entries": [
+          {
+            "x": 20,
+            "y": 30,
+            "text": "Tab Centroid Distances",
+            "color": "#FFFFFF",
+            "size": 14
+          },
+          {
+            "x": 20,
+            "y": 52,
+            "text": "Tabs found: 2",
+            "color": "#00AAFF",
+            "size": 13
+          },
+          {
+            "x": 20,
+            "y": 72,
+            "text": "Tab 1 â†’ Tab 2: 229.2 px",
+            "color": "#FF00FF",
+            "size": 13
+          }
+        ]
+      }
+    ],
+    "metrics": {
+      "num_tabs": 2,
+      "num_pairs": 1,
+      "min_centroid_dist_px": 229.2,
+      "max_centroid_dist_px": 229.2,
+      "avg_centroid_dist_px": 229.2,
+      "tab_1_to_tab_2_dist_px": 229.2
+    },
+    "ctq_results": [
+      {
+        "feature_id": 1,
+        "label": "tab_001",
+        "category": "Tab",
+        "measurements": {
+          "centroid_x_px": 659.85,
+          "centroid_y_px": 178.48
+        }
+      },
+      {
+        "feature_id": 2,
+        "label": "tab_002",
+        "category": "Tab",
+        "measurements": {
+          "centroid_x_px": 889.06,
+          "centroid_y_px": 178.28
+        }
+      },
+      {
+        "feature_id": 1,
+        "label": "tab_001_to_tab_002",
+        "category": "Tab",
+        "measurements": {
+          "centroid_distance_px": 229.2
+        }
+      }
+    ],
+    "stdout": "Tab centroid distances (2 tabs, 1 pair(s)) | Tab 1→Tab 2: 229.2 px\r\n"
+  },
+  "created_at": "2026-03-08T19:10:29.601Z",
+  "updated_at": "2026-03-08T19:10:29.601Z",
+  "source": {
+    "image_filename": "Damaged lithium-ion battery close-up.png",
+    "image_dimensions": {
+      "width": 1536,
+      "height": 1024
+    },
+    "categories": [
+      "Tab",
+      "Seal",
+      "Defect",
+      "Cathode"
+    ],
+    "annotation_count": 5
+  },
+  "tags": []
+}

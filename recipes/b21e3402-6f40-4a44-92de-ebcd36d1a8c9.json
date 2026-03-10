@@ -1,0 +1,718 @@
+{
+  "id": "b21e3402-6f40-4a44-92de-ebcd36d1a8c9",
+  "name": "Feature width measurements",
+  "description": "identify the minimum and maximum measurements and visualize",
+  "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- CONFIGURATION ---\nTARGET_CATEGORY = \"current_collector_edge\"   # category whose width is measured\nNUM_CROSS_SECTIONS = 10                       # number of evenly-spaced cross-sections along the length\nMARGIN_FRACTION = 0.02                        # fractional margin from each end to avoid edge artifacts (0–0.5)\nOVERLAY_COLOR = \"#004488\"                     # color for normal (background) width lines\nMIN_COLOR = \"#FF3333\"                         # color for the minimum-width cross-section highlight\nMAX_COLOR = \"#33FF33\"                         # color for the maximum-width cross-section highlight\nCONTOUR_COLOR = \"#FF8800\"                     # color for contour outline overlay\nTEXT_COLOR = \"#FFFFFF\"                        # color for summary text labels\nMIN_CONTOUR_AREA = 100                        # ignore contours smaller than this (pixels²)\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n\ndef pca_axes(contour):\n    \"\"\"Return (center, major_axis_unit_vec, minor_axis_unit_vec) via PCA on contour points.\"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    center = pts.mean(axis=0)\n    pts_c = pts - center\n    cov = np.cov(pts_c.T)\n    eigvals, eigvecs = np.linalg.eigh(cov)\n    order = np.argsort(eigvals)[::-1]\n    major = eigvecs[:, order[0]]\n    minor = eigvecs[:, order[1]]\n    return center, major, minor\n\n\ndef measure_cross_section_widths(contour, image_shape, n_sections, margin_fraction):\n    \"\"\"\n    Measure the width of a filled contour at n_sections evenly-spaced positions\n    along its principal (length) axis.\n\n    Returns a list of dicts, each with keys:\n        position_along_axis_px, width_px, start_pt, end_pt, mid_pt\n    \"\"\"\n    results = []\n    if cv2.contourArea(contour) < MIN_CONTOUR_AREA:\n        return results\n\n    center, major, minor = pca_axes(contour)\n\n    h, w = image_shape[:2]\n    mask = np.zeros((h, w), dtype=np.uint8)\n    cv2.drawContours(mask, [contour], -1, 255, -1)\n\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    projections = (pts - center) @ major\n    proj_min = float(projections.min())\n    proj_max = float(projections.max())\n    span = proj_max - proj_min\n    m = margin_fraction * span\n    sample_positions = np.linspace(proj_min + m, proj_max - m, n_sections)\n\n    for pos in sample_positions:\n        axis_pt = center + pos * major\n        half_diag = int(np.sqrt(h ** 2 + w ** 2)) + 1\n        t_vals = np.arange(-half_diag, half_diag + 1, 1.0)\n\n        ray_x = axis_pt[0] + t_vals * minor[0]\n        ray_y = axis_pt[1] + t_vals * minor[1]\n        valid = (ray_x >= 0) & (ray_x < w) & (ray_y >= 0) & (ray_y < h)\n        if not np.any(valid):\n            continue\n\n        ray_xi = ray_x[valid].astype(np.int32)\n        ray_yi = ray_y[valid].astype(np.int32)\n        t_valid = t_vals[valid]\n\n        ray_vals = mask[ray_yi, ray_xi]\n        inside = np.where(ray_vals > 0)[0]\n        if len(inside) == 0:\n            continue\n\n        t_enter = float(t_valid[inside[0]])\n        t_exit  = float(t_valid[inside[-1]])\n        width_px = float(abs(t_exit - t_enter))\n        if width_px < 1.0:\n            continue\n\n        pt_start = axis_pt + t_enter * minor\n        pt_end   = axis_pt + t_exit  * minor\n        pt_mid   = (pt_start + pt_end) * 0.5\n\n        results.append({\n            \"position_along_axis_px\": float(pos - proj_min),\n            \"width_px\":  round(width_px, 2),\n            \"start_pt\":  [float(pt_start[0]), float(pt_start[1])],\n            \"end_pt\":    [float(pt_end[0]),   float(pt_end[1])],\n            \"mid_pt\":    [float(pt_mid[0]),   float(pt_mid[1])],\n        })\n\n    return results\n\n\ndef find_min_max_cross_sections(cross_sections):\n    \"\"\"\n    Return the cross-section dicts with the minimum and maximum width_px.\n    Returns (min_cs, max_cs) — each is the dict from measure_cross_section_widths,\n    or None if cross_sections is empty.\n    \"\"\"\n    if not cross_sections:\n        return None, None\n    min_cs = min(cross_sections, key=lambda cs: cs[\"width_px\"])\n    max_cs = max(cross_sections, key=lambda cs: cs[\"width_px\"])\n    return min_cs, max_cs\n\n\ndef measure_contour_extent(contour):\n    \"\"\"Return bounding length and width (px) of a contour along its principal axes.\"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    center, major, minor = pca_axes(contour)\n    pts_c = pts - center\n    proj_major = pts_c @ major\n    proj_minor = pts_c @ minor\n    length_px = float(proj_major.max() - proj_major.min())\n    width_px  = float(proj_minor.max() - proj_minor.min())\n    return length_px, width_px\n\n\n# --- PIPELINE ---\n\ndef find_image_file():\n    \"\"\"Find the single image file in INPUT_DIR.\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\n\ndef load_data():\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\n\ndef get_contour_from_annotation(ann):\n    \"\"\"Extract a single OpenCV contour from a polygon COCO annotation.\"\"\"\n    seg = ann[\"segmentation\"]\n    if not isinstance(seg, list) or len(seg) == 0:\n        return None\n    seg_pts = max(seg, key=len)\n    contour = np.array(seg_pts, dtype=np.float32).reshape(-1, 1, 2)\n    return contour.astype(np.int32)\n\n\ndef build_overlays(contour, cross_sections, min_cs, max_cs):\n    \"\"\"\n    Build overlay objects:\n      - Contour outline\n      - All cross-section lines (dim background color)\n      - Min-width cross-section highlighted in MIN_COLOR with label\n      - Max-width cross-section highlighted in MAX_COLOR with label\n      - Text markers at the mid-points of min/max lines\n    \"\"\"\n    overlays = []\n\n    # 1. Contour outline\n    pts_list = [[float(p[0]), float(p[1])] for p in contour.reshape(-1, 2).tolist()]\n    overlays.append({\n        \"type\": \"contours\",\n        \"points\": pts_list,\n        \"color\": CONTOUR_COLOR,\n        \"label\": TARGET_CATEGORY,\n    })\n\n    # 2. All cross-sections as background reference lines (no labels to avoid clutter)\n    bg_lines = []\n    for cs in cross_sections:\n        bg_lines.append({\n            \"start\": cs[\"start_pt\"],\n            \"end\":   cs[\"end_pt\"],\n            \"value\": \"\",          # suppress per-line label for background lines\n            \"color\": OVERLAY_COLOR,\n        })\n    if bg_lines:\n        overlays.append({\"type\": \"measurements\", \"lines\": bg_lines})\n\n    # 3. Highlighted minimum-width cross-section\n    if min_cs is not None:\n        overlays.append({\n            \"type\": \"measurements\",\n            \"lines\": [{\n                \"start\": min_cs[\"start_pt\"],\n                \"end\":   min_cs[\"end_pt\"],\n                \"value\": f\"MIN {min_cs['width_px']:.1f} px\",\n                \"color\": MIN_COLOR,\n            }]\n        })\n\n    # 4. Highlighted maximum-width cross-section\n    if max_cs is not None:\n        overlays.append({\n            \"type\": \"measurements\",\n            \"lines\": [{\n                \"start\": max_cs[\"start_pt\"],\n                \"end\":   max_cs[\"end_pt\"],\n                \"value\": f\"MAX {max_cs['width_px']:.1f} px\",\n                \"color\": MAX_COLOR,\n            }]\n        })\n\n    # 5. Text labels pinned near the mid-point of each extreme cross-section\n    text_entries = []\n    if min_cs is not None:\n        mx, my = min_cs[\"mid_pt\"]\n        text_entries.append({\n            \"x\": int(mx) + 6, \"y\": int(my) - 8,\n            \"text\": f\"MIN: {min_cs['width_px']:.1f} px\",\n            \"color\": MIN_COLOR, \"size\": 13,\n        })\n    if max_cs is not None:\n        mx, my = max_cs[\"mid_pt\"]\n        text_entries.append({\n            \"x\": int(mx) + 6, \"y\": int(my) - 8,\n            \"text\": f\"MAX: {max_cs['width_px']:.1f} px\",\n            \"color\": MAX_COLOR, \"size\": 13,\n        })\n    if text_entries:\n        overlays.append({\"type\": \"text\", \"entries\": text_entries})\n\n    return overlays\n\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        print(\"ERROR: Could not load image.\")\n        result = {\n            \"overlays\": [], \"metrics\": {\"error\": \"Image load failed\"},\n            \"ctq_results\": [], \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    target_anns = [\n        a for a in coco[\"annotations\"]\n        if cat_map[a[\"category_id\"]] == TARGET_CATEGORY\n    ]\n\n    if not target_anns:\n        print(f\"No annotations found for category '{TARGET_CATEGORY}'.\")\n        result = {\n            \"overlays\": [],\n            \"metrics\": {\"error\": f\"No annotations found for '{TARGET_CATEGORY}'\"},\n            \"ctq_results\": [], \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    all_overlays = []\n    ctq_results  = []\n    all_widths   = []\n    feature_idx  = 1\n\n    for ann in target_anns:\n        contour = get_contour_from_annotation(ann)\n        if contour is None:\n            continue\n        if cv2.contourArea(contour) < MIN_CONTOUR_AREA:\n            continue\n\n        cross_sections = measure_cross_section_widths(\n            contour, image.shape, NUM_CROSS_SECTIONS, MARGIN_FRACTION\n        )\n        if not cross_sections:\n            continue\n\n        length_px, _ = measure_contour_extent(contour)\n        widths = [cs[\"width_px\"] for cs in cross_sections]\n        all_widths.extend(widths)\n\n        # Identify the cross-sections at the extremes\n        min_cs, max_cs = find_min_max_cross_sections(cross_sections)\n\n        label = f\"{TARGET_CATEGORY}_{feature_idx:03d}\"\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\": label,\n            \"category\": TARGET_CATEGORY,\n            \"measurements\": {\n                \"min_width_px\":                round(float(min(widths)), 2),\n                \"min_width_position_along_axis_px\": round(float(min_cs[\"position_along_axis_px\"]), 2) if min_cs else None,\n                \"max_width_px\":                round(float(max(widths)), 2),\n                \"max_width_position_along_axis_px\": round(float(max_cs[\"position_along_axis_px\"]), 2) if max_cs else None,\n                \"mean_width_px\":               round(float(np.mean(widths)), 2),\n                \"std_width_px\":                round(float(np.std(widths)), 2),\n                \"length_px\":                   round(float(length_px), 2),\n                \"num_cross_sections\":          int(len(cross_sections)),\n                \"cross_sections\":              cross_sections,\n            }\n        })\n\n        overlays = build_overlays(contour, cross_sections, min_cs, max_cs)\n        all_overlays.extend(overlays)\n        feature_idx += 1\n\n    # Summary metrics\n    if all_widths:\n        # Find the global min/max cross-section across all features for reporting\n        global_min_cs = min(\n            (cs for r in ctq_results for cs in r[\"measurements\"][\"cross_sections\"]),\n            key=lambda cs: cs[\"width_px\"]\n        )\n        global_max_cs = max(\n            (cs for r in ctq_results for cs in r[\"measurements\"][\"cross_sections\"]),\n            key=lambda cs: cs[\"width_px\"]\n        )\n        metrics = {\n            \"category\":                  TARGET_CATEGORY,\n            \"features_measured\":         int(len(ctq_results)),\n            \"total_cross_sections\":      int(len(all_widths)),\n            \"overall_min_width_px\":      round(float(min(all_widths)), 2),\n            \"min_width_position_px\":     round(float(global_min_cs[\"position_along_axis_px\"]), 2),\n            \"overall_max_width_px\":      round(float(max(all_widths)), 2),\n            \"max_width_position_px\":     round(float(global_max_cs[\"position_along_axis_px\"]), 2),\n            \"overall_mean_width_px\":     round(float(np.mean(all_widths)), 2),\n            \"overall_std_width_px\":      round(float(np.std(all_widths)), 2),\n        }\n    else:\n        metrics = {\"error\": \"No valid cross-sections computed.\"}\n\n    # Summary text overlay — top-left corner\n    if all_widths:\n        summary_entries = [\n            {\"x\": 10, \"y\": 20,  \"text\": f\"Category: {TARGET_CATEGORY}\",                                                                              \"color\": TEXT_COLOR,  \"size\": 14},\n            {\"x\": 10, \"y\": 42,  \"text\": f\"Mean width: {metrics['overall_mean_width_px']:.1f} px\",                                                     \"color\": TEXT_COLOR,  \"size\": 14},\n            {\"x\": 10, \"y\": 64,  \"text\": f\"MIN: {metrics['overall_min_width_px']:.1f} px  @ {metrics['min_width_position_px']:.1f} px along axis\",     \"color\": MIN_COLOR,   \"size\": 14},\n            {\"x\": 10, \"y\": 86,  \"text\": f\"MAX: {metrics['overall_max_width_px']:.1f} px  @ {metrics['max_width_position_px']:.1f} px along axis\",     \"color\": MAX_COLOR,   \"size\": 14},\n            {\"x\": 10, \"y\": 108, \"text\": f\"Cross-sections: {metrics['total_cross_sections']}\",                                                         \"color\": TEXT_COLOR,  \"size\": 14},\n        ]\n        all_overlays.append({\"type\": \"text\", \"entries\": summary_entries})\n\n    result = {\n        \"overlays\": all_overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\",\n    }\n\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n\n    print(\n        f\"Measured {len(ctq_results)} '{TARGET_CATEGORY}' feature(s) | \"\n        f\"{len(all_widths)} cross-sections | \"\n        f\"MIN: {metrics.get('overall_min_width_px', 'N/A')} px | \"\n        f\"MAX: {metrics.get('overall_max_width_px', 'N/A')} px | \"\n        f\"Mean: {metrics.get('overall_mean_width_px', 'N/A')} px\"\n    )\n\n\nmain()",
+  "prompt": "identify the minimum and maximum measurements",
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "Measure the width of the current collector across multiple points. This should be widthwise across the entire length",
+      "timestamp": 1772994430621
+    },
+    {
+      "role": "assistant",
+      "content": "Targeting the `current_collector_edge` annotation to measure its width at multiple evenly-spaced cross-sections along its full length. PCA is used on the contour points to find the principal (length) axis, then perpendicular cross-sections are sampled at regular intervals by rasterizing the contour into a mask and scanning in the rotated frame. Each cross-section produces a width measurement line that is rotated back into image space for overlay rendering.",
+      "thinking": "The user wants to measure the width of the \"current_collector_edge\" or related category across multiple points along its length. Let me think about this carefully.\n\nLooking at the categories: `particle_defect, scratch_defect, delamination_defect, coating_defect, current_collector_edge, cathode_coating`\n\nThe \"current_collector_edge\" likely defines the boundary/edge of the current collector region. To measure the width of the current collector across multiple points along its length, I need to:\n\n1. Find the `current_collector_edge` annotation(s)\n2. The current collector is likely a long rectangular/elongated region\n3. Measure its width at multiple cross-sections along its length (perpendicular measurements)\n\n\n4. I'll extract the contour, determine the primary axis using PCA or bounding box analysis, then take perpendicular width measurements at evenly-spaced intervals along that axis. the bounding box to determine orientation\n- Sample N evenly-spaced positions along the length\n- At each position, cast a perpendicular ray and measure where it intersects the contour boundaries\n- The distance between the two intersection points is the width at that cross-section\n\nFor a more accurate approach with potentially non-rectangular shapes:\n- Use PCA on contour points to find the principal axis\n- Sample along the principal axis\n- Cast perpendicular rays at each sample point\n\nLet me design this properly:\n\n1. Get current_collector_edge contour\n2. Use PCA to find major/minor axes\n3. Sample N points along the major axis\n4. At each sample, find the width in the perpendicular direction by intersecting with the contour\n5. Visualize with measurement lines\n\nFor the cross-section width measurement, I'll create a mask from the contour and sample evenly-spaced positions to measure the extent in the perpendicular direction. A mask-based approach is simpler and more robust than ray casting, especially since the current collector is likely mostly horizontal—I can just find the top and bottom y-coordinates at each sampled column to get the width. But to handle any orientation, I should use PCA to determine whether to sample along the x-axis with vertical cross-sections or use a different approach based on the aspect ratio.\n\nWriting the measurement code...",
+      "timestamp": 1772994430620,
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- CONFIGURATION ---\nTARGET_CATEGORY = \"current_collector_edge\"   # category whose width is measured\nNUM_CROSS_SECTIONS = 20                       # number of evenly-spaced cross-sections along the length\nMARGIN_FRACTION = 0.02                        # fractional margin from each end to avoid edge artifacts (0–0.5)\nOVERLAY_COLOR = \"#00FFFF\"                     # color for width measurement lines\nCONTOUR_COLOR = \"#FF8800\"                     # color for contour outline overlay\nTEXT_COLOR = \"#FFFFFF\"                        # color for summary text labels\nMIN_CONTOUR_AREA = 100                        # ignore contours smaller than this (pixels²)\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n# Generic functions that work on any contour, independent of category names.\n\ndef pca_axes(contour):\n    \"\"\"Return (center, major_axis_unit_vec, minor_axis_unit_vec) via PCA on contour points.\"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    center = pts.mean(axis=0)\n    pts_c = pts - center\n    cov = np.cov(pts_c.T)\n    eigvals, eigvecs = np.linalg.eigh(cov)\n    # eigvecs columns are eigenvectors; sort descending by eigenvalue\n    order = np.argsort(eigvals)[::-1]\n    major = eigvecs[:, order[0]]   # direction of maximum variance = length axis\n    minor = eigvecs[:, order[1]]   # perpendicular = width axis\n    return center, major, minor\n\n\ndef measure_cross_section_widths(contour, image_shape, n_sections, margin_fraction):\n    \"\"\"\n    Measure the width of a filled contour at n_sections evenly-spaced positions\n    along its principal (length) axis.\n\n    Returns a list of dicts, each with:\n        'position_along_axis_px'  : distance from start along major axis\n        'width_px'                : measured width in pixels\n        'start_pt'                : [x, y] of one side of the cross-section in image space\n        'end_pt'                  : [x, y] of other side in image space\n        'mid_pt'                  : [x, y] midpoint of the cross-section\n    \"\"\"\n    results = []\n    if cv2.contourArea(contour) < MIN_CONTOUR_AREA:\n        return results\n\n    center, major, minor = pca_axes(contour)\n\n    # Build a filled mask for the contour\n    h, w = image_shape[:2]\n    mask = np.zeros((h, w), dtype=np.uint8)\n    cv2.drawContours(mask, [contour], -1, 255, -1)\n\n    # Project every contour point onto the major axis to find length extent\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    projections = (pts - center) @ major          # scalar projections along major axis\n    proj_min = float(projections.min())\n    proj_max = float(projections.max())\n    span = proj_max - proj_min\n    m = margin_fraction * span\n    sample_positions = np.linspace(proj_min + m, proj_max - m, n_sections)\n\n    for pos in sample_positions:\n        # Point on the major axis at this position\n        axis_pt = center + pos * major\n\n        # Cast a ray along the minor axis to find where it enters/exits the mask.\n        # Search ±half_diagonal pixels along the minor axis.\n        half_diag = int(np.sqrt(h ** 2 + w ** 2)) + 1\n        t_vals = np.arange(-half_diag, half_diag + 1, 1.0)\n        # Ray points: axis_pt + t * minor\n        ray_x = axis_pt[0] + t_vals * minor[0]\n        ray_y = axis_pt[1] + t_vals * minor[1]\n\n        # Keep only points inside the image\n        valid = (ray_x >= 0) & (ray_x < w) & (ray_y >= 0) & (ray_y < h)\n        if not np.any(valid):\n            continue\n\n        ray_xi = ray_x[valid].astype(np.int32)\n        ray_yi = ray_y[valid].astype(np.int32)\n        t_valid = t_vals[valid]\n\n        # Sample mask along the ray\n        ray_vals = mask[ray_yi, ray_xi]\n        inside = np.where(ray_vals > 0)[0]\n        if len(inside) == 0:\n            continue\n\n        # The first and last inside-mask indices give the cross-section extent\n        t_enter = float(t_valid[inside[0]])\n        t_exit  = float(t_valid[inside[-1]])\n        width_px = float(abs(t_exit - t_enter))\n        if width_px < 1.0:\n            continue\n\n        pt_start = axis_pt + t_enter * minor\n        pt_end   = axis_pt + t_exit  * minor\n        pt_mid   = (pt_start + pt_end) * 0.5\n\n        results.append({\n            \"position_along_axis_px\": float(pos - proj_min),   # distance from start\n            \"width_px\": round(width_px, 2),\n            \"start_pt\": [float(pt_start[0]), float(pt_start[1])],\n            \"end_pt\":   [float(pt_end[0]),   float(pt_end[1])],\n            \"mid_pt\":   [float(pt_mid[0]),   float(pt_mid[1])],\n        })\n\n    return results\n\n\ndef measure_contour_extent(contour):\n    \"\"\"Return bounding length and width (px) of a contour along its principal axes.\"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    center, major, minor = pca_axes(contour)\n    pts_c = pts - center\n    proj_major = pts_c @ major\n    proj_minor = pts_c @ minor\n    length_px = float(proj_major.max() - proj_major.min())\n    width_px  = float(proj_minor.max() - proj_minor.min())\n    return length_px, width_px\n\n\n# --- PIPELINE ---\n\ndef find_image_file():\n    \"\"\"Find the single image file in INPUT_DIR.\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\n\ndef load_data():\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\n\ndef get_contour_from_annotation(ann):\n    \"\"\"Extract a single OpenCV contour from a polygon COCO annotation.\"\"\"\n    seg = ann[\"segmentation\"]\n    if not isinstance(seg, list) or len(seg) == 0:\n        return None\n    # Use the longest polygon segment\n    seg_pts = max(seg, key=len)\n    contour = np.array(seg_pts, dtype=np.float32).reshape(-1, 1, 2)\n    return contour.astype(np.int32)\n\n\ndef build_overlays(contour, cross_sections, ann_id):\n    \"\"\"Build overlay objects for the contour outline and cross-section width lines.\"\"\"\n    overlays = []\n\n    # 1. Contour outline\n    pts_list = contour.reshape(-1, 2).tolist()\n    pts_list = [[float(p[0]), float(p[1])] for p in pts_list]\n    overlays.append({\n        \"type\": \"contours\",\n        \"points\": pts_list,\n        \"color\": CONTOUR_COLOR,\n        \"label\": TARGET_CATEGORY,\n    })\n\n    # 2. Width measurement lines for each cross-section\n    lines = []\n    for cs in cross_sections:\n        lines.append({\n            \"start\": cs[\"start_pt\"],\n            \"end\":   cs[\"end_pt\"],\n            \"value\": f\"{cs['width_px']:.1f} px\",\n            \"color\": OVERLAY_COLOR,\n        })\n    if lines:\n        overlays.append({\"type\": \"measurements\", \"lines\": lines})\n\n    return overlays\n\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        print(\"ERROR: Could not load image.\")\n        result = {\n            \"overlays\": [], \"metrics\": {\"error\": \"Image load failed\"},\n            \"ctq_results\": [], \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Filter to target category\n    target_anns = [\n        a for a in coco[\"annotations\"]\n        if cat_map[a[\"category_id\"]] == TARGET_CATEGORY\n    ]\n\n    if not target_anns:\n        print(f\"No annotations found for category '{TARGET_CATEGORY}'.\")\n        result = {\n            \"overlays\": [], \"metrics\": {\"error\": f\"No annotations found for '{TARGET_CATEGORY}'\"},\n            \"ctq_results\": [], \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    all_overlays = []\n    ctq_results  = []\n    all_widths   = []\n    feature_idx  = 1\n\n    for ann in target_anns:\n        contour = get_contour_from_annotation(ann)\n        if contour is None:\n            continue\n        if cv2.contourArea(contour) < MIN_CONTOUR_AREA:\n            continue\n\n        # Compute cross-section widths along the full length\n        cross_sections = measure_cross_section_widths(\n            contour, image.shape, NUM_CROSS_SECTIONS, MARGIN_FRACTION\n        )\n        if not cross_sections:\n            continue\n\n        length_px, bbox_width_px = measure_contour_extent(contour)\n        widths = [cs[\"width_px\"] for cs in cross_sections]\n        all_widths.extend(widths)\n\n        label = f\"{TARGET_CATEGORY}_{feature_idx:03d}\"\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\": label,\n            \"category\": TARGET_CATEGORY,\n            \"measurements\": {\n                \"min_width_px\":    round(float(min(widths)), 2),\n                \"max_width_px\":    round(float(max(widths)), 2),\n                \"mean_width_px\":   round(float(np.mean(widths)), 2),\n                \"std_width_px\":    round(float(np.std(widths)), 2),\n                \"length_px\":       round(float(length_px), 2),\n                \"num_cross_sections\": int(len(cross_sections)),\n                \"cross_sections\":  cross_sections,   # per-section detail\n            }\n        })\n\n        overlays = build_overlays(contour, cross_sections, ann[\"id\"])\n        all_overlays.extend(overlays)\n        feature_idx += 1\n\n    # Summary metrics\n    metrics = {}\n    if all_widths:\n        metrics = {\n            \"category\": TARGET_CATEGORY,\n            \"features_measured\": int(len(ctq_results)),\n            \"total_cross_sections\": int(len(all_widths)),\n            \"overall_min_width_px\":  round(float(min(all_widths)), 2),\n            \"overall_max_width_px\":  round(float(max(all_widths)), 2),\n            \"overall_mean_width_px\": round(float(np.mean(all_widths)), 2),\n            \"overall_std_width_px\":  round(float(np.std(all_widths)), 2),\n        }\n    else:\n        metrics = {\"error\": \"No valid cross-sections computed.\"}\n\n    # Optional: summary text overlay in top-left corner\n    if all_widths:\n        summary_entries = [\n            {\"x\": 10, \"y\": 20,  \"text\": f\"Category: {TARGET_CATEGORY}\", \"color\": TEXT_COLOR, \"size\": 14},\n            {\"x\": 10, \"y\": 42,  \"text\": f\"Mean width: {metrics['overall_mean_width_px']:.1f} px\", \"color\": TEXT_COLOR, \"size\": 14},\n            {\"x\": 10, \"y\": 64,  \"text\": f\"Min:  {metrics['overall_min_width_px']:.1f} px  |  Max: {metrics['overall_max_width_px']:.1f} px\", \"color\": TEXT_COLOR, \"size\": 14},\n            {\"x\": 10, \"y\": 86,  \"text\": f\"Cross-sections: {metrics['total_cross_sections']}\", \"color\": TEXT_COLOR, \"size\": 14},\n        ]\n        all_overlays.append({\"type\": \"text\", \"entries\": summary_entries})\n\n    result = {\n        \"overlays\": all_overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\",\n    }\n\n    out_path = os.path.join(OUTPUT_DIR, \"result.json\")\n    with open(out_path, \"w\") as f:\n        json.dump(result, f, indent=2)\n\n    print(\n        f\"Measured {len(ctq_results)} '{TARGET_CATEGORY}' feature(s) \"\n        f\"across {len(all_widths)} cross-sections. \"\n        f\"Mean width: {metrics.get('overall_mean_width_px', 'N/A')} px\"\n    )\n\n\nmain()"
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 1.5s. 1 features measured.",
+      "timestamp": 1772994494326
+    },
+    {
+      "role": "user",
+      "content": "change the number of cross sections to 50",
+      "timestamp": 1772994563155
+    },
+    {
+      "role": "assistant",
+      "content": "Updating the NUM_CROSS_SECTIONS configuration parameter from 20 to 50. All other measurement logic remains identical — this change only affects how many evenly-spaced width samples are taken along the current_collector_edge contour's principal axis.",
+      "thinking": "The user wants to change the number of cross sections from 20 to 50. This is a simple configuration change.",
+      "timestamp": 1772994563154,
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- CONFIGURATION ---\nTARGET_CATEGORY = \"current_collector_edge\"   # category whose width is measured\nNUM_CROSS_SECTIONS = 50                       # number of evenly-spaced cross-sections along the length\nMARGIN_FRACTION = 0.02                        # fractional margin from each end to avoid edge artifacts (0–0.5)\nOVERLAY_COLOR = \"#00FFFF\"                     # color for width measurement lines\nCONTOUR_COLOR = \"#FF8800\"                     # color for contour outline overlay\nTEXT_COLOR = \"#FFFFFF\"                        # color for summary text labels\nMIN_CONTOUR_AREA = 100                        # ignore contours smaller than this (pixels²)\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n# Generic functions that work on any contour, independent of category names.\n\ndef pca_axes(contour):\n    \"\"\"Return (center, major_axis_unit_vec, minor_axis_unit_vec) via PCA on contour points.\"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    center = pts.mean(axis=0)\n    pts_c = pts - center\n    cov = np.cov(pts_c.T)\n    eigvals, eigvecs = np.linalg.eigh(cov)\n    # eigvecs columns are eigenvectors; sort descending by eigenvalue\n    order = np.argsort(eigvals)[::-1]\n    major = eigvecs[:, order[0]]   # direction of maximum variance = length axis\n    minor = eigvecs[:, order[1]]   # perpendicular = width axis\n    return center, major, minor\n\n\ndef measure_cross_section_widths(contour, image_shape, n_sections, margin_fraction):\n    \"\"\"\n    Measure the width of a filled contour at n_sections evenly-spaced positions\n    along its principal (length) axis.\n\n    Returns a list of dicts, each with:\n        'position_along_axis_px'  : distance from start along major axis\n        'width_px'                : measured width in pixels\n        'start_pt'                : [x, y] of one side of the cross-section in image space\n        'end_pt'                  : [x, y] of other side in image space\n        'mid_pt'                  : [x, y] midpoint of the cross-section\n    \"\"\"\n    results = []\n    if cv2.contourArea(contour) < MIN_CONTOUR_AREA:\n        return results\n\n    center, major, minor = pca_axes(contour)\n\n    # Build a filled mask for the contour\n    h, w = image_shape[:2]\n    mask = np.zeros((h, w), dtype=np.uint8)\n    cv2.drawContours(mask, [contour], -1, 255, -1)\n\n    # Project every contour point onto the major axis to find length extent\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    projections = (pts - center) @ major          # scalar projections along major axis\n    proj_min = float(projections.min())\n    proj_max = float(projections.max())\n    span = proj_max - proj_min\n    m = margin_fraction * span\n    sample_positions = np.linspace(proj_min + m, proj_max - m, n_sections)\n\n    for pos in sample_positions:\n        # Point on the major axis at this position\n        axis_pt = center + pos * major\n\n        # Cast a ray along the minor axis to find where it enters/exits the mask.\n        # Search ±half_diagonal pixels along the minor axis.\n        half_diag = int(np.sqrt(h ** 2 + w ** 2)) + 1\n        t_vals = np.arange(-half_diag, half_diag + 1, 1.0)\n        # Ray points: axis_pt + t * minor\n        ray_x = axis_pt[0] + t_vals * minor[0]\n        ray_y = axis_pt[1] + t_vals * minor[1]\n\n        # Keep only points inside the image\n        valid = (ray_x >= 0) & (ray_x < w) & (ray_y >= 0) & (ray_y < h)\n        if not np.any(valid):\n            continue\n\n        ray_xi = ray_x[valid].astype(np.int32)\n        ray_yi = ray_y[valid].astype(np.int32)\n        t_valid = t_vals[valid]\n\n        # Sample mask along the ray\n        ray_vals = mask[ray_yi, ray_xi]\n        inside = np.where(ray_vals > 0)[0]\n        if len(inside) == 0:\n            continue\n\n        # The first and last inside-mask indices give the cross-section extent\n        t_enter = float(t_valid[inside[0]])\n        t_exit  = float(t_valid[inside[-1]])\n        width_px = float(abs(t_exit - t_enter))\n        if width_px < 1.0:\n            continue\n\n        pt_start = axis_pt + t_enter * minor\n        pt_end   = axis_pt + t_exit  * minor\n        pt_mid   = (pt_start + pt_end) * 0.5\n\n        results.append({\n            \"position_along_axis_px\": float(pos - proj_min),   # distance from start\n            \"width_px\": round(width_px, 2),\n            \"start_pt\": [float(pt_start[0]), float(pt_start[1])],\n            \"end_pt\":   [float(pt_end[0]),   float(pt_end[1])],\n            \"mid_pt\":   [float(pt_mid[0]),   float(pt_mid[1])],\n        })\n\n    return results\n\n\ndef measure_contour_extent(contour):\n    \"\"\"Return bounding length and width (px) of a contour along its principal axes.\"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    center, major, minor = pca_axes(contour)\n    pts_c = pts - center\n    proj_major = pts_c @ major\n    proj_minor = pts_c @ minor\n    length_px = float(proj_major.max() - proj_major.min())\n    width_px  = float(proj_minor.max() - proj_minor.min())\n    return length_px, width_px\n\n\n# --- PIPELINE ---\n\ndef find_image_file():\n    \"\"\"Find the single image file in INPUT_DIR.\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\n\ndef load_data():\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\n\ndef get_contour_from_annotation(ann):\n    \"\"\"Extract a single OpenCV contour from a polygon COCO annotation.\"\"\"\n    seg = ann[\"segmentation\"]\n    if not isinstance(seg, list) or len(seg) == 0:\n        return None\n    # Use the longest polygon segment\n    seg_pts = max(seg, key=len)\n    contour = np.array(seg_pts, dtype=np.float32).reshape(-1, 1, 2)\n    return contour.astype(np.int32)\n\n\ndef build_overlays(contour, cross_sections, ann_id):\n    \"\"\"Build overlay objects for the contour outline and cross-section width lines.\"\"\"\n    overlays = []\n\n    # 1. Contour outline\n    pts_list = contour.reshape(-1, 2).tolist()\n    pts_list = [[float(p[0]), float(p[1])] for p in pts_list]\n    overlays.append({\n        \"type\": \"contours\",\n        \"points\": pts_list,\n        \"color\": CONTOUR_COLOR,\n        \"label\": TARGET_CATEGORY,\n    })\n\n    # 2. Width measurement lines for each cross-section\n    lines = []\n    for cs in cross_sections:\n        lines.append({\n            \"start\": cs[\"start_pt\"],\n            \"end\":   cs[\"end_pt\"],\n            \"value\": f\"{cs['width_px']:.1f} px\",\n            \"color\": OVERLAY_COLOR,\n        })\n    if lines:\n        overlays.append({\"type\": \"measurements\", \"lines\": lines})\n\n    return overlays\n\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        print(\"ERROR: Could not load image.\")\n        result = {\n            \"overlays\": [], \"metrics\": {\"error\": \"Image load failed\"},\n            \"ctq_results\": [], \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Filter to target category\n    target_anns = [\n        a for a in coco[\"annotations\"]\n        if cat_map[a[\"category_id\"]] == TARGET_CATEGORY\n    ]\n\n    if not target_anns:\n        print(f\"No annotations found for category '{TARGET_CATEGORY}'.\")\n        result = {\n            \"overlays\": [], \"metrics\": {\"error\": f\"No annotations found for '{TARGET_CATEGORY}'\"},\n            \"ctq_results\": [], \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    all_overlays = []\n    ctq_results  = []\n    all_widths   = []\n    feature_idx  = 1\n\n    for ann in target_anns:\n        contour = get_contour_from_annotation(ann)\n        if contour is None:\n            continue\n        if cv2.contourArea(contour) < MIN_CONTOUR_AREA:\n            continue\n\n        # Compute cross-section widths along the full length\n        cross_sections = measure_cross_section_widths(\n            contour, image.shape, NUM_CROSS_SECTIONS, MARGIN_FRACTION\n        )\n        if not cross_sections:\n            continue\n\n        length_px, bbox_width_px = measure_contour_extent(contour)\n        widths = [cs[\"width_px\"] for cs in cross_sections]\n        all_widths.extend(widths)\n\n        label = f\"{TARGET_CATEGORY}_{feature_idx:03d}\"\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\": label,\n            \"category\": TARGET_CATEGORY,\n            \"measurements\": {\n                \"min_width_px\":       round(float(min(widths)), 2),\n                \"max_width_px\":       round(float(max(widths)), 2),\n                \"mean_width_px\":      round(float(np.mean(widths)), 2),\n                \"std_width_px\":       round(float(np.std(widths)), 2),\n                \"length_px\":          round(float(length_px), 2),\n                \"num_cross_sections\": int(len(cross_sections)),\n                \"cross_sections\":     cross_sections,   # per-section detail\n            }\n        })\n\n        overlays = build_overlays(contour, cross_sections, ann[\"id\"])\n        all_overlays.extend(overlays)\n        feature_idx += 1\n\n    # Summary metrics\n    metrics = {}\n    if all_widths:\n        metrics = {\n            \"category\": TARGET_CATEGORY,\n            \"features_measured\":     int(len(ctq_results)),\n            \"total_cross_sections\":  int(len(all_widths)),\n            \"overall_min_width_px\":  round(float(min(all_widths)), 2),\n            \"overall_max_width_px\":  round(float(max(all_widths)), 2),\n            \"overall_mean_width_px\": round(float(np.mean(all_widths)), 2),\n            \"overall_std_width_px\":  round(float(np.std(all_widths)), 2),\n        }\n    else:\n        metrics = {\"error\": \"No valid cross-sections computed.\"}\n\n    # Optional: summary text overlay in top-left corner\n    if all_widths:\n        summary_entries = [\n            {\"x\": 10, \"y\": 20, \"text\": f\"Category: {TARGET_CATEGORY}\",                                                                             \"color\": TEXT_COLOR, \"size\": 14},\n            {\"x\": 10, \"y\": 42, \"text\": f\"Mean width: {metrics['overall_mean_width_px']:.1f} px\",                                                    \"color\": TEXT_COLOR, \"size\": 14},\n            {\"x\": 10, \"y\": 64, \"text\": f\"Min:  {metrics['overall_min_width_px']:.1f} px  |  Max: {metrics['overall_max_width_px']:.1f} px\",         \"color\": TEXT_COLOR, \"size\": 14},\n            {\"x\": 10, \"y\": 86, \"text\": f\"Cross-sections: {metrics['total_cross_sections']}\",                                                        \"color\": TEXT_COLOR, \"size\": 14},\n        ]\n        all_overlays.append({\"type\": \"text\", \"entries\": summary_entries})\n\n    result = {\n        \"overlays\": all_overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\",\n    }\n\n    out_path = os.path.join(OUTPUT_DIR, \"result.json\")\n    with open(out_path, \"w\") as f:\n        json.dump(result, f, indent=2)\n\n    print(\n        f\"Measured {len(ctq_results)} '{TARGET_CATEGORY}' feature(s) \"\n        f\"across {len(all_widths)} cross-sections. \"\n        f\"Mean width: {metrics.get('overall_mean_width_px', 'N/A')} px\"\n    )\n\n\nmain()"
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 1 features measured.",
+      "timestamp": 1772994608525
+    },
+    {
+      "role": "user",
+      "content": "Suggest next step for finding the minimum and maximum measurements",
+      "timestamp": 1772994649184
+    },
+    {
+      "role": "assistant",
+      "content": "## Results So Far\n\nYour 50 cross-section measurement already captured `min_width_px`, `max_width_px`, `mean_width_px`, and `std_width_px` — these are already in your CTQ output! From the last run:\n\n- **Mean width**: 96.06 px\n- The min/max values are stored in the `cross_sections` field per feature\n\n## Suggested Next Steps\n\n**1. Extract & Highlight Min/Max Cross-Sections**\nAsk to visualize *which specific cross-sections* correspond to the minimum and maximum widths — this will draw those two lines in a different color (e.g. red for min, green for max) on the overlay image so you can see *where* along the edge the narrowest and widest points occur.\n\n**2. Convert to Real-World Units**\nIf you know the physical scale (e.g. microns per pixel), the min/max values can be converted to meaningful engineering units for a CTQ report.\n\n**3. Check Variation (Std Dev)**\nYour `std_width_px` tells you how consistent the current collector edge width is. A high std dev relative to mean width could indicate a tapering or irregular coating edge worth flagging.\n\n## Ready to Proceed?\n\nType something like **\"highlight the minimum and maximum width cross-sections in different colors\"** and click **Generate** to produce the visualization code.",
+      "timestamp": 1772994649184
+    },
+    {
+      "role": "user",
+      "content": "identify the minimum and maximum measurements",
+      "timestamp": 1772994709928
+    },
+    {
+      "role": "assistant",
+      "content": "Targeting the `current_collector_edge` category and using the same cross-section width technique as before. The update identifies which specific cross-sections correspond to the minimum and maximum width measurements, rendering them with distinct highlight colors and labeled measurement lines so their locations are immediately visible on the canvas. All other cross-sections remain as background reference lines.",
+      "thinking": "The user wants to identify the minimum and maximum width measurements from the cross-sections, specifically highlighting which cross-sections have the minimum and maximum widths with visual overlays. The previous code already computes min and max widths, but the user wants to visually identify them - i.e., highlight the specific cross-section lines that correspond to the min and max measurements.\n\nLet me modify the code to:\n1. Keep all existing measurements\n2. Add distinct visual overlays that highlight the specific cross-section with the minimum width and the specific cross-section with the maximum width\n3. Add text labels specifically calling out which ones are min/max\n\nThe key change is in the overlay building - instead of rendering all cross-sections the same color, we should render the min and max cross-sections with distinct colors and prominent labels.",
+      "timestamp": 1772994709927,
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- CONFIGURATION ---\nTARGET_CATEGORY = \"current_collector_edge\"   # category whose width is measured\nNUM_CROSS_SECTIONS = 50                       # number of evenly-spaced cross-sections along the length\nMARGIN_FRACTION = 0.02                        # fractional margin from each end to avoid edge artifacts (0–0.5)\nOVERLAY_COLOR = \"#004488\"                     # color for normal (background) width lines\nMIN_COLOR = \"#FF3333\"                         # color for the minimum-width cross-section highlight\nMAX_COLOR = \"#33FF33\"                         # color for the maximum-width cross-section highlight\nCONTOUR_COLOR = \"#FF8800\"                     # color for contour outline overlay\nTEXT_COLOR = \"#FFFFFF\"                        # color for summary text labels\nMIN_CONTOUR_AREA = 100                        # ignore contours smaller than this (pixels²)\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n\ndef pca_axes(contour):\n    \"\"\"Return (center, major_axis_unit_vec, minor_axis_unit_vec) via PCA on contour points.\"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    center = pts.mean(axis=0)\n    pts_c = pts - center\n    cov = np.cov(pts_c.T)\n    eigvals, eigvecs = np.linalg.eigh(cov)\n    order = np.argsort(eigvals)[::-1]\n    major = eigvecs[:, order[0]]\n    minor = eigvecs[:, order[1]]\n    return center, major, minor\n\n\ndef measure_cross_section_widths(contour, image_shape, n_sections, margin_fraction):\n    \"\"\"\n    Measure the width of a filled contour at n_sections evenly-spaced positions\n    along its principal (length) axis.\n\n    Returns a list of dicts, each with keys:\n        position_along_axis_px, width_px, start_pt, end_pt, mid_pt\n    \"\"\"\n    results = []\n    if cv2.contourArea(contour) < MIN_CONTOUR_AREA:\n        return results\n\n    center, major, minor = pca_axes(contour)\n\n    h, w = image_shape[:2]\n    mask = np.zeros((h, w), dtype=np.uint8)\n    cv2.drawContours(mask, [contour], -1, 255, -1)\n\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    projections = (pts - center) @ major\n    proj_min = float(projections.min())\n    proj_max = float(projections.max())\n    span = proj_max - proj_min\n    m = margin_fraction * span\n    sample_positions = np.linspace(proj_min + m, proj_max - m, n_sections)\n\n    for pos in sample_positions:\n        axis_pt = center + pos * major\n        half_diag = int(np.sqrt(h ** 2 + w ** 2)) + 1\n        t_vals = np.arange(-half_diag, half_diag + 1, 1.0)\n\n        ray_x = axis_pt[0] + t_vals * minor[0]\n        ray_y = axis_pt[1] + t_vals * minor[1]\n        valid = (ray_x >= 0) & (ray_x < w) & (ray_y >= 0) & (ray_y < h)\n        if not np.any(valid):\n            continue\n\n        ray_xi = ray_x[valid].astype(np.int32)\n        ray_yi = ray_y[valid].astype(np.int32)\n        t_valid = t_vals[valid]\n\n        ray_vals = mask[ray_yi, ray_xi]\n        inside = np.where(ray_vals > 0)[0]\n        if len(inside) == 0:\n            continue\n\n        t_enter = float(t_valid[inside[0]])\n        t_exit  = float(t_valid[inside[-1]])\n        width_px = float(abs(t_exit - t_enter))\n        if width_px < 1.0:\n            continue\n\n        pt_start = axis_pt + t_enter * minor\n        pt_end   = axis_pt + t_exit  * minor\n        pt_mid   = (pt_start + pt_end) * 0.5\n\n        results.append({\n            \"position_along_axis_px\": float(pos - proj_min),\n            \"width_px\":  round(width_px, 2),\n            \"start_pt\":  [float(pt_start[0]), float(pt_start[1])],\n            \"end_pt\":    [float(pt_end[0]),   float(pt_end[1])],\n            \"mid_pt\":    [float(pt_mid[0]),   float(pt_mid[1])],\n        })\n\n    return results\n\n\ndef find_min_max_cross_sections(cross_sections):\n    \"\"\"\n    Return the cross-section dicts with the minimum and maximum width_px.\n    Returns (min_cs, max_cs) — each is the dict from measure_cross_section_widths,\n    or None if cross_sections is empty.\n    \"\"\"\n    if not cross_sections:\n        return None, None\n    min_cs = min(cross_sections, key=lambda cs: cs[\"width_px\"])\n    max_cs = max(cross_sections, key=lambda cs: cs[\"width_px\"])\n    return min_cs, max_cs\n\n\ndef measure_contour_extent(contour):\n    \"\"\"Return bounding length and width (px) of a contour along its principal axes.\"\"\"\n    pts = contour.reshape(-1, 2).astype(np.float64)\n    center, major, minor = pca_axes(contour)\n    pts_c = pts - center\n    proj_major = pts_c @ major\n    proj_minor = pts_c @ minor\n    length_px = float(proj_major.max() - proj_major.min())\n    width_px  = float(proj_minor.max() - proj_minor.min())\n    return length_px, width_px\n\n\n# --- PIPELINE ---\n\ndef find_image_file():\n    \"\"\"Find the single image file in INPUT_DIR.\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\n\ndef load_data():\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\n\ndef get_contour_from_annotation(ann):\n    \"\"\"Extract a single OpenCV contour from a polygon COCO annotation.\"\"\"\n    seg = ann[\"segmentation\"]\n    if not isinstance(seg, list) or len(seg) == 0:\n        return None\n    seg_pts = max(seg, key=len)\n    contour = np.array(seg_pts, dtype=np.float32).reshape(-1, 1, 2)\n    return contour.astype(np.int32)\n\n\ndef build_overlays(contour, cross_sections, min_cs, max_cs):\n    \"\"\"\n    Build overlay objects:\n      - Contour outline\n      - All cross-section lines (dim background color)\n      - Min-width cross-section highlighted in MIN_COLOR with label\n      - Max-width cross-section highlighted in MAX_COLOR with label\n      - Text markers at the mid-points of min/max lines\n    \"\"\"\n    overlays = []\n\n    # 1. Contour outline\n    pts_list = [[float(p[0]), float(p[1])] for p in contour.reshape(-1, 2).tolist()]\n    overlays.append({\n        \"type\": \"contours\",\n        \"points\": pts_list,\n        \"color\": CONTOUR_COLOR,\n        \"label\": TARGET_CATEGORY,\n    })\n\n    # 2. All cross-sections as background reference lines (no labels to avoid clutter)\n    bg_lines = []\n    for cs in cross_sections:\n        bg_lines.append({\n            \"start\": cs[\"start_pt\"],\n            \"end\":   cs[\"end_pt\"],\n            \"value\": \"\",          # suppress per-line label for background lines\n            \"color\": OVERLAY_COLOR,\n        })\n    if bg_lines:\n        overlays.append({\"type\": \"measurements\", \"lines\": bg_lines})\n\n    # 3. Highlighted minimum-width cross-section\n    if min_cs is not None:\n        overlays.append({\n            \"type\": \"measurements\",\n            \"lines\": [{\n                \"start\": min_cs[\"start_pt\"],\n                \"end\":   min_cs[\"end_pt\"],\n                \"value\": f\"MIN {min_cs['width_px']:.1f} px\",\n                \"color\": MIN_COLOR,\n            }]\n        })\n\n    # 4. Highlighted maximum-width cross-section\n    if max_cs is not None:\n        overlays.append({\n            \"type\": \"measurements\",\n            \"lines\": [{\n                \"start\": max_cs[\"start_pt\"],\n                \"end\":   max_cs[\"end_pt\"],\n                \"value\": f\"MAX {max_cs['width_px']:.1f} px\",\n                \"color\": MAX_COLOR,\n            }]\n        })\n\n    # 5. Text labels pinned near the mid-point of each extreme cross-section\n    text_entries = []\n    if min_cs is not None:\n        mx, my = min_cs[\"mid_pt\"]\n        text_entries.append({\n            \"x\": int(mx) + 6, \"y\": int(my) - 8,\n            \"text\": f\"MIN: {min_cs['width_px']:.1f} px\",\n            \"color\": MIN_COLOR, \"size\": 13,\n        })\n    if max_cs is not None:\n        mx, my = max_cs[\"mid_pt\"]\n        text_entries.append({\n            \"x\": int(mx) + 6, \"y\": int(my) - 8,\n            \"text\": f\"MAX: {max_cs['width_px']:.1f} px\",\n            \"color\": MAX_COLOR, \"size\": 13,\n        })\n    if text_entries:\n        overlays.append({\"type\": \"text\", \"entries\": text_entries})\n\n    return overlays\n\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        print(\"ERROR: Could not load image.\")\n        result = {\n            \"overlays\": [], \"metrics\": {\"error\": \"Image load failed\"},\n            \"ctq_results\": [], \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    target_anns = [\n        a for a in coco[\"annotations\"]\n        if cat_map[a[\"category_id\"]] == TARGET_CATEGORY\n    ]\n\n    if not target_anns:\n        print(f\"No annotations found for category '{TARGET_CATEGORY}'.\")\n        result = {\n            \"overlays\": [],\n            \"metrics\": {\"error\": f\"No annotations found for '{TARGET_CATEGORY}'\"},\n            \"ctq_results\": [], \"stdout\": \"\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    all_overlays = []\n    ctq_results  = []\n    all_widths   = []\n    feature_idx  = 1\n\n    for ann in target_anns:\n        contour = get_contour_from_annotation(ann)\n        if contour is None:\n            continue\n        if cv2.contourArea(contour) < MIN_CONTOUR_AREA:\n            continue\n\n        cross_sections = measure_cross_section_widths(\n            contour, image.shape, NUM_CROSS_SECTIONS, MARGIN_FRACTION\n        )\n        if not cross_sections:\n            continue\n\n        length_px, _ = measure_contour_extent(contour)\n        widths = [cs[\"width_px\"] for cs in cross_sections]\n        all_widths.extend(widths)\n\n        # Identify the cross-sections at the extremes\n        min_cs, max_cs = find_min_max_cross_sections(cross_sections)\n\n        label = f\"{TARGET_CATEGORY}_{feature_idx:03d}\"\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\": label,\n            \"category\": TARGET_CATEGORY,\n            \"measurements\": {\n                \"min_width_px\":                round(float(min(widths)), 2),\n                \"min_width_position_along_axis_px\": round(float(min_cs[\"position_along_axis_px\"]), 2) if min_cs else None,\n                \"max_width_px\":                round(float(max(widths)), 2),\n                \"max_width_position_along_axis_px\": round(float(max_cs[\"position_along_axis_px\"]), 2) if max_cs else None,\n                \"mean_width_px\":               round(float(np.mean(widths)), 2),\n                \"std_width_px\":                round(float(np.std(widths)), 2),\n                \"length_px\":                   round(float(length_px), 2),\n                \"num_cross_sections\":          int(len(cross_sections)),\n                \"cross_sections\":              cross_sections,\n            }\n        })\n\n        overlays = build_overlays(contour, cross_sections, min_cs, max_cs)\n        all_overlays.extend(overlays)\n        feature_idx += 1\n\n    # Summary metrics\n    if all_widths:\n        # Find the global min/max cross-section across all features for reporting\n        global_min_cs = min(\n            (cs for r in ctq_results for cs in r[\"measurements\"][\"cross_sections\"]),\n            key=lambda cs: cs[\"width_px\"]\n        )\n        global_max_cs = max(\n            (cs for r in ctq_results for cs in r[\"measurements\"][\"cross_sections\"]),\n            key=lambda cs: cs[\"width_px\"]\n        )\n        metrics = {\n            \"category\":                  TARGET_CATEGORY,\n            \"features_measured\":         int(len(ctq_results)),\n            \"total_cross_sections\":      int(len(all_widths)),\n            \"overall_min_width_px\":      round(float(min(all_widths)), 2),\n            \"min_width_position_px\":     round(float(global_min_cs[\"position_along_axis_px\"]), 2),\n            \"overall_max_width_px\":      round(float(max(all_widths)), 2),\n            \"max_width_position_px\":     round(float(global_max_cs[\"position_along_axis_px\"]), 2),\n            \"overall_mean_width_px\":     round(float(np.mean(all_widths)), 2),\n            \"overall_std_width_px\":      round(float(np.std(all_widths)), 2),\n        }\n    else:\n        metrics = {\"error\": \"No valid cross-sections computed.\"}\n\n    # Summary text overlay — top-left corner\n    if all_widths:\n        summary_entries = [\n            {\"x\": 10, \"y\": 20,  \"text\": f\"Category: {TARGET_CATEGORY}\",                                                                              \"color\": TEXT_COLOR,  \"size\": 14},\n            {\"x\": 10, \"y\": 42,  \"text\": f\"Mean width: {metrics['overall_mean_width_px']:.1f} px\",                                                     \"color\": TEXT_COLOR,  \"size\": 14},\n            {\"x\": 10, \"y\": 64,  \"text\": f\"MIN: {metrics['overall_min_width_px']:.1f} px  @ {metrics['min_width_position_px']:.1f} px along axis\",     \"color\": MIN_COLOR,   \"size\": 14},\n            {\"x\": 10, \"y\": 86,  \"text\": f\"MAX: {metrics['overall_max_width_px']:.1f} px  @ {metrics['max_width_position_px']:.1f} px along axis\",     \"color\": MAX_COLOR,   \"size\": 14},\n            {\"x\": 10, \"y\": 108, \"text\": f\"Cross-sections: {metrics['total_cross_sections']}\",                                                         \"color\": TEXT_COLOR,  \"size\": 14},\n        ]\n        all_overlays.append({\"type\": \"text\", \"entries\": summary_entries})\n\n    result = {\n        \"overlays\": all_overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\",\n    }\n\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n\n    print(\n        f\"Measured {len(ctq_results)} '{TARGET_CATEGORY}' feature(s) | \"\n        f\"{len(all_widths)} cross-sections | \"\n        f\"MIN: {metrics.get('overall_min_width_px', 'N/A')} px | \"\n        f\"MAX: {metrics.get('overall_max_width_px', 'N/A')} px | \"\n        f\"Mean: {metrics.get('overall_mean_width_px', 'N/A')} px\"\n    )\n\n\nmain()"
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 1 features measured.",
+      "timestamp": 1772994766248
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.2s. 1 features measured.",
+      "timestamp": 1772994785498
+    }
+  ],
+  "last_result": {
+    "overlays": [
+      {
+        "type": "contours",
+        "points": [
+          [
+            173,
+            0
+          ],
+          [
+            168,
+            8
+          ],
+          [
+            166,
+            316
+          ],
+          [
+            168,
+            335
+          ],
+          [
+            166,
+            365
+          ],
+          [
+            168,
+            389
+          ],
+          [
+            166,
+            425
+          ],
+          [
+            168,
+            438
+          ],
+          [
+            168,
+            594
+          ],
+          [
+            171,
+            666
+          ],
+          [
+            170,
+            743
+          ],
+          [
+            173,
+            774
+          ],
+          [
+            172,
+            859
+          ],
+          [
+            174,
+            898
+          ],
+          [
+            172,
+            901
+          ],
+          [
+            175,
+            948
+          ],
+          [
+            175,
+            1016
+          ],
+          [
+            177,
+            1024
+          ],
+          [
+            271,
+            1024
+          ],
+          [
+            270,
+            868
+          ],
+          [
+            267,
+            844
+          ],
+          [
+            269,
+            828
+          ],
+          [
+            267,
+            740
+          ],
+          [
+            269,
+            730
+          ],
+          [
+            267,
+            723
+          ],
+          [
+            268,
+            688
+          ],
+          [
+            265,
+            646
+          ],
+          [
+            267,
+            629
+          ],
+          [
+            266,
+            584
+          ],
+          [
+            264,
+            575
+          ],
+          [
+            265,
+            479
+          ],
+          [
+            263,
+            446
+          ],
+          [
+            265,
+            441
+          ],
+          [
+            265,
+            367
+          ],
+          [
+            262,
+            336
+          ],
+          [
+            264,
+            326
+          ],
+          [
+            264,
+            296
+          ],
+          [
+            261,
+            262
+          ],
+          [
+            263,
+            255
+          ],
+          [
+            261,
+            220
+          ],
+          [
+            263,
+            171
+          ],
+          [
+            260,
+            76
+          ],
+          [
+            261,
+            5
+          ],
+          [
+            259,
+            0
+          ],
+          [
+            231,
+            0
+          ],
+          [
+            228,
+            3
+          ],
+          [
+            225,
+            3
+          ],
+          [
+            223,
+            0
+          ],
+          [
+            218,
+            0
+          ],
+          [
+            217,
+            2
+          ],
+          [
+            216,
+            0
+          ]
+        ],
+        "color": "#FF8800",
+        "label": "current_collector_edge"
+      },
+      {
+        "type": "measurements",
+        "lines": [
+          {
+            "start": [
+              261.990938569618,
+              20.535529568167476
+            ],
+            "end": [
+              168.99762380456463,
+              19.420447056550298
+            ],
+            "value": "",
+            "color": "#004488"
+          },
+          {
+            "start": [
+              262.67998906591026,
+              129.87533988628442
+            ],
+            "end": [
+              167.68681806935047,
+              128.7362771056002
+            ],
+            "value": "",
+            "color": "#004488"
+          },
+          {
+            "start": [
+              262.3691114464493,
+              239.20316006986778
+            ],
+            "end": [
+              167.3759404498895,
+              238.06409728918356
+            ],
+            "value": "",
+            "color": "#004488"
+          },
+          {
+            "start": [
+              263.05816194274166,
+              348.54297038798467
+            ],
+            "end": [
+              167.0650628304286,
+              347.3919174727669
+            ],
+            "value": "",
+            "color": "#004488"
+          },
+          {
+            "start": [
+              264.7471405547873,
+              457.8947708406351
+            ],
+            "end": [
+              168.75404144247418,
+              456.74371792541734
+            ],
+            "value": "",
+            "color": "#004488"
+          },
+          {
+            "start": [
+              264.43626293532634,
+              567.2225910242186
+            ],
+            "end": [
+              168.4431638230132,
+              566.0715381090008
+            ],
+            "value": "",
+            "color": "#004488"
+          },
+          {
+            "start": [
+              267.1251696631252,
+              676.5863816114024
+            ],
+            "end": [
+              171.13207055081207,
+              675.4353286961847
+            ],
+            "value": "",
+            "color": "#004488"
+          },
+          {
+            "start": [
+              268.81414827517074,
+              785.9381820640529
+            ],
+            "end": [
+              173.82097727861094,
+              784.7991192833687
+            ],
+            "value": "",
+            "color": "#004488"
+          },
+          {
+            "start": [
+              270.50312688721635,
+              895.2899825167033
+            ],
+            "end": [
+              174.51002777490322,
+              894.1389296014855
+            ],
+            "value": "",
+            "color": "#004488"
+          },
+          {
+            "start": [
+              271.1921773835087,
+              1004.6297928348201
+            ],
+            "end": [
+              175.19907827119556,
+              1003.4787399196024
+            ],
+            "value": "",
+            "color": "#004488"
+          }
+        ]
+      },
+      {
+        "type": "measurements",
+        "lines": [
+          {
+            "start": [
+              261.990938569618,
+              20.535529568167476
+            ],
+            "end": [
+              168.99762380456463,
+              19.420447056550298
+            ],
+            "value": "MIN 93.0 px",
+            "color": "#FF3333"
+          }
+        ]
+      },
+      {
+        "type": "measurements",
+        "lines": [
+          {
+            "start": [
+              263.05816194274166,
+              348.54297038798467
+            ],
+            "end": [
+              167.0650628304286,
+              347.3919174727669
+            ],
+            "value": "MAX 96.0 px",
+            "color": "#33FF33"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "entries": [
+          {
+            "x": 221,
+            "y": 11,
+            "text": "MIN: 93.0 px",
+            "color": "#FF3333",
+            "size": 13
+          },
+          {
+            "x": 221,
+            "y": 339,
+            "text": "MAX: 96.0 px",
+            "color": "#33FF33",
+            "size": 13
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "entries": [
+          {
+            "x": 10,
+            "y": 20,
+            "text": "Category: current_collector_edge",
+            "color": "#FFFFFF",
+            "size": 14
+          },
+          {
+            "x": 10,
+            "y": 42,
+            "text": "Mean width: 95.4 px",
+            "color": "#FFFFFF",
+            "size": 14
+          },
+          {
+            "x": 10,
+            "y": 64,
+            "text": "MIN: 93.0 px  @ 20.5 px along axis",
+            "color": "#FF3333",
+            "size": 14
+          },
+          {
+            "x": 10,
+            "y": 86,
+            "text": "MAX: 96.0 px  @ 348.5 px along axis",
+            "color": "#33FF33",
+            "size": 14
+          },
+          {
+            "x": 10,
+            "y": 108,
+            "text": "Cross-sections: 10",
+            "color": "#FFFFFF",
+            "size": 14
+          }
+        ]
+      }
+    ],
+    "metrics": {
+      "category": "current_collector_edge",
+      "features_measured": 1,
+      "total_cross_sections": 10,
+      "overall_min_width_px": 93,
+      "min_width_position_px": 20.5,
+      "overall_max_width_px": 96,
+      "max_width_position_px": 348.47,
+      "overall_mean_width_px": 95.4,
+      "overall_std_width_px": 0.92
+    },
+    "ctq_results": [
+      {
+        "feature_id": 2,
+        "label": "current_collector_edge_001",
+        "category": "current_collector_edge",
+        "measurements": {
+          "min_width_px": 93,
+          "min_width_position_along_axis_px": 20.5,
+          "max_width_px": 96,
+          "max_width_position_along_axis_px": 348.47,
+          "mean_width_px": 95.4,
+          "std_width_px": 0.92,
+          "length_px": 1024.91,
+          "num_cross_sections": 10,
+          "cross_sections": [
+            {
+              "position_along_axis_px": 20.49819163126176,
+              "width_px": 93,
+              "start_pt": [
+                261.990938569618,
+                20.535529568167476
+              ],
+              "end_pt": [
+                168.99762380456463,
+                19.420447056550298
+              ],
+              "mid_pt": [
+                215.4942811870913,
+                19.97798831235889
+              ]
+            },
+            {
+              "position_along_axis_px": 129.8218803313245,
+              "width_px": 95,
+              "start_pt": [
+                262.67998906591026,
+                129.87533988628442
+              ],
+              "end_pt": [
+                167.68681806935047,
+                128.7362771056002
+              ],
+              "mid_pt": [
+                215.18340356763036,
+                129.3058084959423
+              ]
+            },
+            {
+              "position_along_axis_px": 239.14556903138725,
+              "width_px": 95,
+              "start_pt": [
+                262.3691114464493,
+                239.20316006986778
+              ],
+              "end_pt": [
+                167.3759404498895,
+                238.06409728918356
+              ],
+              "mid_pt": [
+                214.87252594816943,
+                238.63362867952566
+              ]
+            },
+            {
+              "position_along_axis_px": 348.46925773145,
+              "width_px": 96,
+              "start_pt": [
+                263.05816194274166,
+                348.54297038798467
+              ],
+              "end_pt": [
+                167.0650628304286,
+                347.3919174727669
+              ],
+              "mid_pt": [
+                215.06161238658513,
+                347.9674439303758
+              ]
+            },
+            {
+              "position_along_axis_px": 457.79294643151275,
+              "width_px": 96,
+              "start_pt": [
+                264.7471405547873,
+                457.8947708406351
+              ],
+              "end_pt": [
+                168.75404144247418,
+                456.74371792541734
+              ],
+              "mid_pt": [
+                216.75059099863074,
+                457.3192443830262
+              ]
+            },
+            {
+              "position_along_axis_px": 567.1166351315755,
+              "width_px": 96,
+              "start_pt": [
+                264.43626293532634,
+                567.2225910242186
+              ],
+              "end_pt": [
+                168.4431638230132,
+                566.0715381090008
+              ],
+              "mid_pt": [
+                216.43971337916977,
+                566.6470645666097
+              ]
+            },
+            {
+              "position_along_axis_px": 676.4403238316382,
+              "width_px": 96,
+              "start_pt": [
+                267.1251696631252,
+                676.5863816114024
+              ],
+              "end_pt": [
+                171.13207055081207,
+                675.4353286961847
+              ],
+              "mid_pt": [
+                219.12862010696864,
+                676.0108551537935
+              ]
+            },
+            {
+              "position_along_axis_px": 785.7640125317009,
+              "width_px": 95,
+              "start_pt": [
+                268.81414827517074,
+                785.9381820640529
+              ],
+              "end_pt": [
+                173.82097727861094,
+                784.7991192833687
+              ],
+              "mid_pt": [
+                221.31756277689084,
+                785.3686506737108
+              ]
+            },
+            {
+              "position_along_axis_px": 895.0877012317637,
+              "width_px": 96,
+              "start_pt": [
+                270.50312688721635,
+                895.2899825167033
+              ],
+              "end_pt": [
+                174.51002777490322,
+                894.1389296014855
+              ],
+              "mid_pt": [
+                222.5065773310598,
+                894.7144560590943
+              ]
+            },
+            {
+              "position_along_axis_px": 1004.4113899318264,
+              "width_px": 96,
+              "start_pt": [
+                271.1921773835087,
+                1004.6297928348201
+              ],
+              "end_pt": [
+                175.19907827119556,
+                1003.4787399196024
+              ],
+              "mid_pt": [
+                223.19562782735213,
+                1004.0542663772112
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "stdout": "Measured 1 'current_collector_edge' feature(s) | 10 cross-sections | MIN: 93.0 px | MAX: 96.0 px | Mean: 95.4 px\r\n"
+  },
+  "created_at": "2026-03-08T18:34:43.022Z",
+  "updated_at": "2026-03-08T18:34:43.022Z",
+  "source": {
+    "image_filename": "ChatGPT Image Mar 1, 2026, 12_30_06 PM.png",
+    "image_dimensions": {
+      "width": 1536,
+      "height": 1024
+    },
+    "categories": [
+      "particle_defect",
+      "scratch_defect",
+      "delamination_defect",
+      "coating_defect",
+      "current_collector_edge",
+      "cathode_coating"
+    ],
+    "annotation_count": 6
+  },
+  "tags": []
+}

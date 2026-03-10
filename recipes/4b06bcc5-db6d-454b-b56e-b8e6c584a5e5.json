@@ -1,0 +1,336 @@
+{
+  "id": "4b06bcc5-db6d-454b-b56e-b8e6c584a5e5",
+  "name": "Defect Area",
+  "description": "measure the defect area",
+  "code": "import cv2\nimport numpy as np\nimport json\nimport os\nimport math\n\n# --- CONFIGURATION ---\nTARGET_CATEGORIES = {\"Defect\"}           # categories to measure\nMIN_CONTOUR_AREA = 1.0                   # ignore contours smaller than this (pixels²)\nOVERLAY_COLOR = \"#FF4444\"                # color for defect contour overlays\nBBOX_COLOR = \"#FF8800\"                   # color for bounding box overlays\nTEXT_COLOR = \"#FFFFFF\"                   # color for text labels\nTEXT_SIZE = 14                           # font size for text labels\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n\ndef measure_contour_area(contour):\n    \"\"\"Measure the area of any contour in pixels². Returns a float.\"\"\"\n    return float(cv2.contourArea(contour))\n\ndef extract_contour_from_polygon(segmentation):\n    \"\"\"Convert a COCO polygon segmentation to an OpenCV contour array.\"\"\"\n    seg = segmentation[0]  # take first polygon\n    contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n    return contour\n\ndef contour_bounding_box(contour):\n    \"\"\"Return bounding box (x, y, w, h) for any contour.\"\"\"\n    x, y, w, h = cv2.boundingRect(contour)\n    return int(x), int(y), int(w), int(h)\n\ndef contour_centroid(contour):\n    \"\"\"Return (cx, cy) centroid of a contour.\"\"\"\n    M = cv2.moments(contour)\n    if M[\"m00\"] == 0:\n        x, y, w, h = cv2.boundingRect(contour)\n        return int(x + w // 2), int(y + h // 2)\n    cx = int(M[\"m10\"] / M[\"m00\"])\n    cy = int(M[\"m01\"] / M[\"m00\"])\n    return cx, cy\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef find_image_file():\n    \"\"\"Find the image file in INPUT_DIR (there is always exactly one).\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(ctq_results, contours_by_id):\n    \"\"\"Create visual overlays: contour outlines, bounding boxes, and area labels.\"\"\"\n    overlays = []\n    contour_overlays = []\n    bbox_boxes = []\n    text_entries = []\n\n    for result in ctq_results:\n        ann_id = result[\"feature_id\"]\n        area_px = result[\"measurements\"][\"area_px\"]\n        label = result[\"label\"]\n\n        contour = contours_by_id.get(ann_id)\n        if contour is None:\n            continue\n\n        # Contour overlay\n        points = [[int(pt[0][0]), int(pt[0][1])] for pt in contour]\n        overlays.append({\n            \"type\": \"contours\",\n            \"points\": points,\n            \"color\": OVERLAY_COLOR,\n            \"label\": f\"{area_px:.1f} px²\"\n        })\n\n        # Bounding box overlay\n        x, y, w, h = contour_bounding_box(contour)\n        bbox_boxes.append({\n            \"x\": x,\n            \"y\": y,\n            \"width\": w,\n            \"height\": h,\n            \"label\": f\"{label}: {area_px:.1f} px²\",\n            \"color\": BBOX_COLOR\n        })\n\n        # Text label at centroid\n        cx, cy = contour_centroid(contour)\n        text_entries.append({\n            \"x\": cx,\n            \"y\": cy,\n            \"text\": f\"{area_px:.1f} px²\",\n            \"color\": TEXT_COLOR,\n            \"size\": TEXT_SIZE\n        })\n\n    if bbox_boxes:\n        overlays.append({\"type\": \"bboxes\", \"boxes\": bbox_boxes})\n    if text_entries:\n        overlays.append({\"type\": \"text\", \"entries\": text_entries})\n\n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        print(\"ERROR: Failed to load image.\")\n        result = {\n            \"overlays\": [],\n            \"metrics\": {\"error\": \"Image load failed\"},\n            \"ctq_results\": [],\n            \"stdout\": \"ERROR: Image load failed\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Filter annotations to target categories\n    target_anns = [\n        a for a in coco[\"annotations\"]\n        if cat_map[a[\"category_id\"]] in TARGET_CATEGORIES\n        and isinstance(a[\"segmentation\"], list)\n        and len(a[\"segmentation\"]) > 0\n    ]\n\n    if not target_anns:\n        print(f\"No annotations found for categories: {TARGET_CATEGORIES}\")\n        result = {\n            \"overlays\": [],\n            \"metrics\": {\"error\": f\"No annotations found for categories: {sorted(TARGET_CATEGORIES)}\"},\n            \"ctq_results\": [],\n            \"stdout\": f\"No annotations found for categories: {TARGET_CATEGORIES}\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    ctq_results = []\n    contours_by_id = {}\n    category_counts = {}\n    total_area = 0.0\n\n    for idx, ann in enumerate(target_anns, start=1):\n        cat_name = cat_map[ann[\"category_id\"]]\n        contour = extract_contour_from_polygon(ann[\"segmentation\"])\n\n        area_px = measure_contour_area(contour)\n        if area_px < MIN_CONTOUR_AREA:\n            continue\n\n        label = f\"{cat_name.lower()}_{idx:03d}\"\n        contours_by_id[ann[\"id\"]] = contour\n        total_area += area_px\n        category_counts[cat_name] = category_counts.get(cat_name, 0) + 1\n\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\": label,\n            \"category\": cat_name,\n            \"measurements\": {\n                \"area_px\": round(area_px, 2)\n            }\n        })\n\n    # Summary metrics\n    count = len(ctq_results)\n    avg_area = (total_area / count) if count > 0 else 0.0\n    metrics = {\n        \"defect_count\": count,\n        \"total_area_px\": round(total_area, 2),\n        \"avg_area_px\": round(avg_area, 2),\n        \"min_area_px\": round(min(r[\"measurements\"][\"area_px\"] for r in ctq_results), 2) if ctq_results else 0.0,\n        \"max_area_px\": round(max(r[\"measurements\"][\"area_px\"] for r in ctq_results), 2) if ctq_results else 0.0,\n    }\n    # Per-category counts\n    for cat_name, cnt in category_counts.items():\n        metrics[f\"{cat_name.lower()}_count\"] = cnt\n\n    overlays = build_overlays(ctq_results, contours_by_id)\n\n    summary = (\n        f\"Processed {count} defect(s) | \"\n        f\"Total area: {total_area:.1f} px² | \"\n        f\"Avg area: {avg_area:.1f} px²\"\n    )\n    print(summary)\n\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": summary\n    }\n\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n\nmain()",
+  "prompt": "measure the defect area",
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "measure the defect area",
+      "timestamp": 1773013023989
+    },
+    {
+      "role": "assistant",
+      "content": "Measuring the contour area (in pixels²) for all \"Defect\" category annotations using polygon segmentation geometry. Each defect's contour is extracted from the segmentation polygon and measured with `cv2.contourArea()` for accurate results. A bounding box overlay and area label are rendered for each defect found.",
+      "timestamp": 1773013023989,
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\nimport math\n\n# --- CONFIGURATION ---\nTARGET_CATEGORIES = {\"Defect\"}           # categories to measure\nMIN_CONTOUR_AREA = 1.0                   # ignore contours smaller than this (pixels²)\nOVERLAY_COLOR = \"#FF4444\"                # color for defect contour overlays\nBBOX_COLOR = \"#FF8800\"                   # color for bounding box overlays\nTEXT_COLOR = \"#FFFFFF\"                   # color for text labels\nTEXT_SIZE = 14                           # font size for text labels\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".tif\", \".tiff\", \".bmp\", \".webp\"}\n\n# --- MEASUREMENT FUNCTIONS ---\n\ndef measure_contour_area(contour):\n    \"\"\"Measure the area of any contour in pixels². Returns a float.\"\"\"\n    return float(cv2.contourArea(contour))\n\ndef extract_contour_from_polygon(segmentation):\n    \"\"\"Convert a COCO polygon segmentation to an OpenCV contour array.\"\"\"\n    seg = segmentation[0]  # take first polygon\n    contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n    return contour\n\ndef contour_bounding_box(contour):\n    \"\"\"Return bounding box (x, y, w, h) for any contour.\"\"\"\n    x, y, w, h = cv2.boundingRect(contour)\n    return int(x), int(y), int(w), int(h)\n\ndef contour_centroid(contour):\n    \"\"\"Return (cx, cy) centroid of a contour.\"\"\"\n    M = cv2.moments(contour)\n    if M[\"m00\"] == 0:\n        x, y, w, h = cv2.boundingRect(contour)\n        return int(x + w // 2), int(y + h // 2)\n    cx = int(M[\"m10\"] / M[\"m00\"])\n    cy = int(M[\"m01\"] / M[\"m00\"])\n    return cx, cy\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef find_image_file():\n    \"\"\"Find the image file in INPUT_DIR (there is always exactly one).\"\"\"\n    for f in os.listdir(INPUT_DIR):\n        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:\n            return os.path.join(INPUT_DIR, f)\n    return None\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image_path = find_image_file()\n    image = cv2.imread(image_path) if image_path else None\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(ctq_results, contours_by_id):\n    \"\"\"Create visual overlays: contour outlines, bounding boxes, and area labels.\"\"\"\n    overlays = []\n    contour_overlays = []\n    bbox_boxes = []\n    text_entries = []\n\n    for result in ctq_results:\n        ann_id = result[\"feature_id\"]\n        area_px = result[\"measurements\"][\"area_px\"]\n        label = result[\"label\"]\n\n        contour = contours_by_id.get(ann_id)\n        if contour is None:\n            continue\n\n        # Contour overlay\n        points = [[int(pt[0][0]), int(pt[0][1])] for pt in contour]\n        overlays.append({\n            \"type\": \"contours\",\n            \"points\": points,\n            \"color\": OVERLAY_COLOR,\n            \"label\": f\"{area_px:.1f} px²\"\n        })\n\n        # Bounding box overlay\n        x, y, w, h = contour_bounding_box(contour)\n        bbox_boxes.append({\n            \"x\": x,\n            \"y\": y,\n            \"width\": w,\n            \"height\": h,\n            \"label\": f\"{label}: {area_px:.1f} px²\",\n            \"color\": BBOX_COLOR\n        })\n\n        # Text label at centroid\n        cx, cy = contour_centroid(contour)\n        text_entries.append({\n            \"x\": cx,\n            \"y\": cy,\n            \"text\": f\"{area_px:.1f} px²\",\n            \"color\": TEXT_COLOR,\n            \"size\": TEXT_SIZE\n        })\n\n    if bbox_boxes:\n        overlays.append({\"type\": \"bboxes\", \"boxes\": bbox_boxes})\n    if text_entries:\n        overlays.append({\"type\": \"text\", \"entries\": text_entries})\n\n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n\n    if image is None:\n        print(\"ERROR: Failed to load image.\")\n        result = {\n            \"overlays\": [],\n            \"metrics\": {\"error\": \"Image load failed\"},\n            \"ctq_results\": [],\n            \"stdout\": \"ERROR: Image load failed\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    # Filter annotations to target categories\n    target_anns = [\n        a for a in coco[\"annotations\"]\n        if cat_map[a[\"category_id\"]] in TARGET_CATEGORIES\n        and isinstance(a[\"segmentation\"], list)\n        and len(a[\"segmentation\"]) > 0\n    ]\n\n    if not target_anns:\n        print(f\"No annotations found for categories: {TARGET_CATEGORIES}\")\n        result = {\n            \"overlays\": [],\n            \"metrics\": {\"error\": f\"No annotations found for categories: {sorted(TARGET_CATEGORIES)}\"},\n            \"ctq_results\": [],\n            \"stdout\": f\"No annotations found for categories: {TARGET_CATEGORIES}\"\n        }\n        with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n            json.dump(result, f, indent=2)\n        return\n\n    ctq_results = []\n    contours_by_id = {}\n    category_counts = {}\n    total_area = 0.0\n\n    for idx, ann in enumerate(target_anns, start=1):\n        cat_name = cat_map[ann[\"category_id\"]]\n        contour = extract_contour_from_polygon(ann[\"segmentation\"])\n\n        area_px = measure_contour_area(contour)\n        if area_px < MIN_CONTOUR_AREA:\n            continue\n\n        label = f\"{cat_name.lower()}_{idx:03d}\"\n        contours_by_id[ann[\"id\"]] = contour\n        total_area += area_px\n        category_counts[cat_name] = category_counts.get(cat_name, 0) + 1\n\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\": label,\n            \"category\": cat_name,\n            \"measurements\": {\n                \"area_px\": round(area_px, 2)\n            }\n        })\n\n    # Summary metrics\n    count = len(ctq_results)\n    avg_area = (total_area / count) if count > 0 else 0.0\n    metrics = {\n        \"defect_count\": count,\n        \"total_area_px\": round(total_area, 2),\n        \"avg_area_px\": round(avg_area, 2),\n        \"min_area_px\": round(min(r[\"measurements\"][\"area_px\"] for r in ctq_results), 2) if ctq_results else 0.0,\n        \"max_area_px\": round(max(r[\"measurements\"][\"area_px\"] for r in ctq_results), 2) if ctq_results else 0.0,\n    }\n    # Per-category counts\n    for cat_name, cnt in category_counts.items():\n        metrics[f\"{cat_name.lower()}_count\"] = cnt\n\n    overlays = build_overlays(ctq_results, contours_by_id)\n\n    summary = (\n        f\"Processed {count} defect(s) | \"\n        f\"Total area: {total_area:.1f} px² | \"\n        f\"Avg area: {avg_area:.1f} px²\"\n    )\n    print(summary)\n\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": summary\n    }\n\n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f, indent=2)\n\nmain()"
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 1 features measured.",
+      "timestamp": 1773013050858
+    }
+  ],
+  "last_result": {
+    "overlays": [
+      {
+        "type": "contours",
+        "points": [
+          [
+            653,
+            587
+          ],
+          [
+            648,
+            585
+          ],
+          [
+            642,
+            588
+          ],
+          [
+            642,
+            594
+          ],
+          [
+            645,
+            599
+          ],
+          [
+            638,
+            609
+          ],
+          [
+            632,
+            613
+          ],
+          [
+            623,
+            610
+          ],
+          [
+            615,
+            611
+          ],
+          [
+            609,
+            615
+          ],
+          [
+            600,
+            617
+          ],
+          [
+            593,
+            623
+          ],
+          [
+            584,
+            624
+          ],
+          [
+            585,
+            627
+          ],
+          [
+            581,
+            629
+          ],
+          [
+            558,
+            629
+          ],
+          [
+            545,
+            634
+          ],
+          [
+            535,
+            634
+          ],
+          [
+            528,
+            638
+          ],
+          [
+            525,
+            644
+          ],
+          [
+            525,
+            650
+          ],
+          [
+            521,
+            655
+          ],
+          [
+            521,
+            678
+          ],
+          [
+            516,
+            698
+          ],
+          [
+            516,
+            712
+          ],
+          [
+            512,
+            718
+          ],
+          [
+            504,
+            723
+          ],
+          [
+            509,
+            731
+          ],
+          [
+            507,
+            752
+          ],
+          [
+            500,
+            769
+          ],
+          [
+            502,
+            774
+          ],
+          [
+            510,
+            775
+          ],
+          [
+            514,
+            781
+          ],
+          [
+            549,
+            784
+          ],
+          [
+            630,
+            785
+          ],
+          [
+            638,
+            784
+          ],
+          [
+            643,
+            774
+          ],
+          [
+            661,
+            770
+          ],
+          [
+            658,
+            765
+          ],
+          [
+            673,
+            758
+          ],
+          [
+            673,
+            755
+          ],
+          [
+            664,
+            755
+          ],
+          [
+            660,
+            750
+          ],
+          [
+            663,
+            735
+          ],
+          [
+            675,
+            724
+          ],
+          [
+            697,
+            717
+          ],
+          [
+            703,
+            708
+          ],
+          [
+            703,
+            697
+          ],
+          [
+            695,
+            692
+          ],
+          [
+            700,
+            689
+          ],
+          [
+            702,
+            684
+          ],
+          [
+            697,
+            678
+          ],
+          [
+            699,
+            674
+          ],
+          [
+            697,
+            671
+          ],
+          [
+            686,
+            670
+          ],
+          [
+            663,
+            650
+          ],
+          [
+            660,
+            634
+          ],
+          [
+            663,
+            620
+          ],
+          [
+            660,
+            617
+          ],
+          [
+            659,
+            594
+          ]
+        ],
+        "color": "#FF4444",
+        "label": "26301.5 pxÂ²"
+      },
+      {
+        "type": "bboxes",
+        "boxes": [
+          {
+            "x": 500,
+            "y": 585,
+            "width": 204,
+            "height": 201,
+            "label": "defect_001: 26301.5 pxÂ²",
+            "color": "#FF8800"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "entries": [
+          {
+            "x": 598,
+            "y": 701,
+            "text": "26301.5 pxÂ²",
+            "color": "#FFFFFF",
+            "size": 14
+          }
+        ]
+      }
+    ],
+    "metrics": {
+      "defect_count": 1,
+      "total_area_px": 26301.5,
+      "avg_area_px": 26301.5,
+      "min_area_px": 26301.5,
+      "max_area_px": 26301.5
+    },
+    "ctq_results": [
+      {
+        "feature_id": 3,
+        "label": "defect_001",
+        "category": "Defect",
+        "measurements": {
+          "area_px": 26301.5
+        }
+      }
+    ],
+    "stdout": "Processed 1 defect(s) | Total area: 26301.5 px² | Avg area: 26301.5 px²\r\n"
+  },
+  "created_at": "2026-03-09T00:03:27.515Z",
+  "updated_at": "2026-03-09T00:03:27.515Z",
+  "source": {
+    "image_filename": "Damaged lithium-ion battery close-up.png",
+    "image_dimensions": {
+      "width": 1536,
+      "height": 1024
+    },
+    "categories": [
+      "Tab",
+      "Seal",
+      "Defect",
+      "Cathode"
+    ],
+    "annotation_count": 5
+  },
+  "tags": []
+}

@@ -1,0 +1,433 @@
+{
+  "id": "d0db38f2-1350-4957-bb83-c5a76982ae14",
+  "name": "Total Defect Count",
+  "description": "count the number of defects",
+  "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results.\n\ndef count_defects_by_category(annotations, cat_map):\n    \"\"\"Count defects by category, excluding non-defect categories.\"\"\"\n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    defect_counts = {}\n    total_defects = 0\n    \n    for ann in annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        if category_name in defect_categories:\n            defect_counts[category_name] = defect_counts.get(category_name, 0) + 1\n            total_defects += 1\n    \n    return total_defects, defect_counts\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"Battery cathode defects in grayscale.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(defect_annotations, cat_map):\n    \"\"\"Create visual overlays showing numbered defects.\"\"\"\n    overlays = []\n    \n    # Extract contours for defects\n    contour_data = []\n    text_entries = []\n    \n    defect_counter = 1\n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Add contour overlay\n            contour_points = contour.reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(category_name, '#FFFFFF'),\n                \"label\": f\"{category_name}_{defect_counter:03d}\"\n            })\n            \n            # Calculate centroid for text placement\n            moments = cv2.moments(contour)\n            if moments[\"m00\"] != 0:\n                cx = int(moments[\"m10\"] / moments[\"m00\"])\n                cy = int(moments[\"m01\"] / moments[\"m00\"])\n            else:\n                # Fallback to bbox center\n                bbox = ann[\"bbox\"]\n                cx = int(bbox[0] + bbox[2] / 2)\n                cy = int(bbox[1] + bbox[3] / 2)\n            \n            # Add numbered label\n            text_entries.append({\n                \"x\": int(cx),\n                \"y\": int(cy),\n                \"text\": str(defect_counter),\n                \"color\": \"#FFFFFF\",\n                \"size\": 16\n            })\n            \n            defect_counter += 1\n    \n    # Add text overlay\n    if text_entries:\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": text_entries\n        })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Filter annotations to only defects\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    # Count defects\n    total_defects, defect_counts = count_defects_by_category(coco[\"annotations\"], cat_map)\n    \n    # Build CTQ results - one entry per defect\n    ctq_results = []\n    defect_counter = 1\n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\": f\"{category_name}_{defect_counter:03d}\",\n            \"category\": category_name,\n            \"measurements\": {\n                \"count\": 1  # Each defect counts as 1\n            }\n        })\n        defect_counter += 1\n    \n    # Build overlays\n    overlays = build_overlays(defect_annotations, cat_map)\n    \n    # Summary metrics\n    metrics = {\n        \"total_defects\": int(total_defects)\n    }\n    \n    # Add individual defect type counts to metrics\n    for defect_type, count in defect_counts.items():\n        metrics[f\"{defect_type}_count\"] = int(count)\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Found {total_defects} total defects across {len(defect_counts)} categories\")\n\nmain()\n",
+  "prompt": "count the number of defects",
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "count the number of defects",
+      "timestamp": 1772390609436
+    },
+    {
+      "role": "assistant",
+      "content": "I'll count the number of defects by identifying all annotations that are defect categories (excluding structural elements like cathode_coating and current_collector_edge). I'll provide counts both overall and by defect type, with visual overlays showing each defect with a numbered label.",
+      "code": "import cv2\nimport numpy as np\nimport json\nimport os\n\n# --- MEASUREMENT FUNCTIONS ---\n# Pure measurement logic below. These functions take annotation data\n# and return measurement results.\n\ndef count_defects_by_category(annotations, cat_map):\n    \"\"\"Count defects by category, excluding non-defect categories.\"\"\"\n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    defect_counts = {}\n    total_defects = 0\n    \n    for ann in annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        if category_name in defect_categories:\n            defect_counts[category_name] = defect_counts.get(category_name, 0) + 1\n            total_defects += 1\n    \n    return total_defects, defect_counts\n\n# --- PIPELINE (I/O, overlays, result assembly) ---\n\ndef load_data():\n    \"\"\"Load image and COCO annotations.\"\"\"\n    image = cv2.imread(os.path.join(INPUT_DIR, \"Battery cathode defects in grayscale.png\"))\n    with open(os.path.join(INPUT_DIR, \"annotations.json\")) as f:\n        coco = json.load(f)\n    cat_map = {c[\"id\"]: c[\"name\"] for c in coco[\"categories\"]}\n    return image, coco, cat_map\n\ndef build_overlays(defect_annotations, cat_map):\n    \"\"\"Create visual overlays showing numbered defects.\"\"\"\n    overlays = []\n    \n    # Extract contours for defects\n    contour_data = []\n    text_entries = []\n    \n    defect_counter = 1\n    colors = {\n        'particle_defect': '#FF0000',    # Red\n        'scratch_defect': '#00FF00',     # Green  \n        'delamination_defect': '#0000FF', # Blue\n        'coating_defect': '#FFFF00'      # Yellow\n    }\n    \n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        \n        # Extract contour from segmentation\n        if isinstance(ann[\"segmentation\"], list) and len(ann[\"segmentation\"]) > 0:\n            seg = ann[\"segmentation\"][0]\n            contour = np.array(seg).reshape(-1, 1, 2).astype(np.int32)\n            \n            # Add contour overlay\n            contour_points = contour.reshape(-1, 2).tolist()\n            overlays.append({\n                \"type\": \"contours\",\n                \"points\": contour_points,\n                \"color\": colors.get(category_name, '#FFFFFF'),\n                \"label\": f\"{category_name}_{defect_counter:03d}\"\n            })\n            \n            # Calculate centroid for text placement\n            moments = cv2.moments(contour)\n            if moments[\"m00\"] != 0:\n                cx = int(moments[\"m10\"] / moments[\"m00\"])\n                cy = int(moments[\"m01\"] / moments[\"m00\"])\n            else:\n                # Fallback to bbox center\n                bbox = ann[\"bbox\"]\n                cx = int(bbox[0] + bbox[2] / 2)\n                cy = int(bbox[1] + bbox[3] / 2)\n            \n            # Add numbered label\n            text_entries.append({\n                \"x\": int(cx),\n                \"y\": int(cy),\n                \"text\": str(defect_counter),\n                \"color\": \"#FFFFFF\",\n                \"size\": 16\n            })\n            \n            defect_counter += 1\n    \n    # Add text overlay\n    if text_entries:\n        overlays.append({\n            \"type\": \"text\",\n            \"entries\": text_entries\n        })\n    \n    return overlays\n\ndef main():\n    image, coco, cat_map = load_data()\n    \n    # Define defect categories (exclude structural elements)\n    defect_categories = {'particle_defect', 'scratch_defect', 'delamination_defect', 'coating_defect'}\n    \n    # Filter annotations to only defects\n    defect_annotations = [ann for ann in coco[\"annotations\"] \n                         if cat_map[ann[\"category_id\"]] in defect_categories]\n    \n    # Count defects\n    total_defects, defect_counts = count_defects_by_category(coco[\"annotations\"], cat_map)\n    \n    # Build CTQ results - one entry per defect\n    ctq_results = []\n    defect_counter = 1\n    for ann in defect_annotations:\n        category_name = cat_map[ann[\"category_id\"]]\n        ctq_results.append({\n            \"feature_id\": int(ann[\"id\"]),\n            \"label\": f\"{category_name}_{defect_counter:03d}\",\n            \"category\": category_name,\n            \"measurements\": {\n                \"count\": 1  # Each defect counts as 1\n            }\n        })\n        defect_counter += 1\n    \n    # Build overlays\n    overlays = build_overlays(defect_annotations, cat_map)\n    \n    # Summary metrics\n    metrics = {\n        \"total_defects\": int(total_defects)\n    }\n    \n    # Add individual defect type counts to metrics\n    for defect_type, count in defect_counts.items():\n        metrics[f\"{defect_type}_count\"] = int(count)\n    \n    # Write result\n    result = {\n        \"overlays\": overlays,\n        \"metrics\": metrics,\n        \"ctq_results\": ctq_results,\n        \"stdout\": \"\"\n    }\n    \n    with open(os.path.join(OUTPUT_DIR, \"result.json\"), \"w\") as f:\n        json.dump(result, f)\n    \n    print(f\"Found {total_defects} total defects across {len(defect_counts)} categories\")\n\nmain()\n",
+      "timestamp": 1772390609436
+    },
+    {
+      "role": "system",
+      "content": "Execution succeeded in 0.3s. 4 features measured.",
+      "timestamp": 1772390609738
+    }
+  ],
+  "last_result": {
+    "overlays": [
+      {
+        "type": "contours",
+        "points": [
+          [
+            402,
+            214
+          ],
+          [
+            409,
+            210
+          ],
+          [
+            418,
+            209
+          ],
+          [
+            429,
+            213
+          ],
+          [
+            436,
+            221
+          ],
+          [
+            434,
+            230
+          ],
+          [
+            425,
+            237
+          ],
+          [
+            414,
+            239
+          ],
+          [
+            406,
+            235
+          ],
+          [
+            401,
+            227
+          ]
+        ],
+        "color": "#FF0000",
+        "label": "particle_defect_001"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            926,
+            157
+          ],
+          [
+            941,
+            153
+          ],
+          [
+            958,
+            151
+          ],
+          [
+            974,
+            153
+          ],
+          [
+            989,
+            159
+          ],
+          [
+            1007,
+            169
+          ],
+          [
+            1025,
+            179
+          ],
+          [
+            1047,
+            194
+          ],
+          [
+            1060,
+            203
+          ],
+          [
+            1068,
+            212
+          ],
+          [
+            1073,
+            220
+          ],
+          [
+            1076,
+            231
+          ],
+          [
+            1073,
+            240
+          ],
+          [
+            1066,
+            247
+          ],
+          [
+            1057,
+            250
+          ],
+          [
+            1045,
+            246
+          ],
+          [
+            1027,
+            236
+          ],
+          [
+            1013,
+            227
+          ],
+          [
+            999,
+            218
+          ],
+          [
+            982,
+            208
+          ],
+          [
+            965,
+            199
+          ],
+          [
+            948,
+            190
+          ],
+          [
+            934,
+            181
+          ],
+          [
+            924,
+            171
+          ]
+        ],
+        "color": "#00FF00",
+        "label": "scratch_defect_002"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            331,
+            597
+          ],
+          [
+            346,
+            588
+          ],
+          [
+            365,
+            585
+          ],
+          [
+            386,
+            589
+          ],
+          [
+            408,
+            601
+          ],
+          [
+            423,
+            616
+          ],
+          [
+            432,
+            636
+          ],
+          [
+            437,
+            658
+          ],
+          [
+            436,
+            681
+          ],
+          [
+            428,
+            701
+          ],
+          [
+            411,
+            717
+          ],
+          [
+            392,
+            726
+          ],
+          [
+            371,
+            728
+          ],
+          [
+            352,
+            723
+          ],
+          [
+            338,
+            712
+          ],
+          [
+            328,
+            698
+          ],
+          [
+            323,
+            678
+          ],
+          [
+            323,
+            659
+          ]
+        ],
+        "color": "#0000FF",
+        "label": "delamination_defect_003"
+      },
+      {
+        "type": "contours",
+        "points": [
+          [
+            846,
+            609
+          ],
+          [
+            869,
+            600
+          ],
+          [
+            895,
+            598
+          ],
+          [
+            916,
+            603
+          ],
+          [
+            933,
+            615
+          ],
+          [
+            947,
+            631
+          ],
+          [
+            958,
+            653
+          ],
+          [
+            963,
+            677
+          ],
+          [
+            960,
+            700
+          ],
+          [
+            949,
+            722
+          ],
+          [
+            931,
+            740
+          ],
+          [
+            910,
+            751
+          ],
+          [
+            887,
+            753
+          ],
+          [
+            864,
+            746
+          ],
+          [
+            846,
+            732
+          ],
+          [
+            835,
+            713
+          ],
+          [
+            829,
+            692
+          ],
+          [
+            830,
+            669
+          ]
+        ],
+        "color": "#FFFF00",
+        "label": "coating_defect_004"
+      },
+      {
+        "type": "text",
+        "entries": [
+          {
+            "x": 417,
+            "y": 223,
+            "text": "1",
+            "color": "#FFFFFF",
+            "size": 16
+          },
+          {
+            "x": 1003,
+            "y": 196,
+            "text": "2",
+            "color": "#FFFFFF",
+            "size": 16
+          },
+          {
+            "x": 377,
+            "y": 657,
+            "text": "3",
+            "color": "#FFFFFF",
+            "size": 16
+          },
+          {
+            "x": 894,
+            "y": 675,
+            "text": "4",
+            "color": "#FFFFFF",
+            "size": 16
+          }
+        ]
+      }
+    ],
+    "metrics": {
+      "total_defects": 4,
+      "particle_defect_count": 1,
+      "scratch_defect_count": 1,
+      "delamination_defect_count": 1,
+      "coating_defect_count": 1
+    },
+    "ctq_results": [
+      {
+        "feature_id": 1,
+        "label": "particle_defect_001",
+        "category": "particle_defect",
+        "measurements": {
+          "count": 1
+        }
+      },
+      {
+        "feature_id": 2,
+        "label": "scratch_defect_002",
+        "category": "scratch_defect",
+        "measurements": {
+          "count": 1
+        }
+      },
+      {
+        "feature_id": 3,
+        "label": "delamination_defect_003",
+        "category": "delamination_defect",
+        "measurements": {
+          "count": 1
+        }
+      },
+      {
+        "feature_id": 4,
+        "label": "coating_defect_004",
+        "category": "coating_defect",
+        "measurements": {
+          "count": 1
+        }
+      }
+    ],
+    "stdout": "Found 4 total defects across 4 categories\r\n"
+  },
+  "created_at": "2026-03-01T18:44:14.242Z",
+  "updated_at": "2026-03-01T18:44:14.242Z",
+  "source": {
+    "image_filename": "Battery cathode defects in grayscale.png",
+    "image_dimensions": {
+      "width": 1536,
+      "height": 1024
+    },
+    "categories": [
+      "particle_defect",
+      "scratch_defect",
+      "delamination_defect",
+      "coating_defect",
+      "current_collector_edge",
+      "cathode_coating"
+    ],
+    "annotation_count": 6
+  },
+  "tags": [
+    "defects"
+  ]
+}
